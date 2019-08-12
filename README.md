@@ -42,7 +42,7 @@ Update the Ubuntu package index and install Basalt:
 sudo apt-get update
 sudo apt-get install basalt
 ```
-### Source installation for Ubuntu 18.04 and MacOS 10.14 Mojave
+### Source installation for Ubuntu 18.04 and MacOS >= 10.11 El Capitan
 Clone the source code for the project and build it. For MacOS you should have [Homebrew](https://brew.sh/) installed.
 ```
 git clone --recursive https://gitlab.com/VladyslavUsenko/basalt.git
@@ -56,9 +56,12 @@ make -j8
 NOTE: It is possible to compile the code on Ubuntu 16.04, but you need to install cmake-3.10 or higher and gcc-7. See corresponding [Dockerfile](docker/b_image_xenial/Dockerfile) as an example.
 
 ## Usage
-* [Camera, IMU and Mocap calibration.](doc/Calibration.md)
-* [Visual-inertial odometry and mapping.](doc/VioMapping.md)
+* [Camera, IMU and Mocap calibration. (TUM-VI, Euroc and UZH-FPV datasets)](doc/Calibration.md)
+* [Visual-inertial odometry and mapping. (TUM-VI and Euroc datasets)](doc/VioMapping.md)
 * [Simulation tools to test different components of the system.](doc/Simulation.md)
+
+## Development
+* [Development environment setup.](doc/DevSetup.md)
 
 ## Licence
 The code is provided under a BSD 3-clause license. See the LICENSE file for details.

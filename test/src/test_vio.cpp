@@ -21,7 +21,7 @@ std::mt19937 gen{rd()};
 std::normal_distribution<> gyro_noise_dist{0, gyro_std_dev};
 std::normal_distribution<> accel_noise_dist{0, accel_std_dev};
 
-TEST(PreIntegrationTestSuite, ImuNullspace2Test) {
+TEST(VioTestSuite, ImuNullspace2Test) {
   int num_knots = 15;
 
   Eigen::Vector3d bg, ba;
@@ -40,6 +40,10 @@ TEST(PreIntegrationTestSuite, ImuNullspace2Test) {
   state0.vel_w_i = gt_spline.transVelWorld(int64_t(0));
   state0.bias_gyro = bg;
   state0.bias_accel = ba;
+
+  Eigen::Vector3d accel_cov, gyro_cov;
+  accel_cov.setConstant(accel_std_dev * accel_std_dev);
+  gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
 
   int64_t dt_ns = 1e7;
   for (int64_t t_ns = dt_ns / 2;
@@ -63,12 +67,9 @@ TEST(PreIntegrationTestSuite, ImuNullspace2Test) {
     data.gyro[1] += gyro_noise_dist(gen);
     data.gyro[2] += gyro_noise_dist(gen);
 
-    data.accel_cov.setConstant(accel_std_dev * accel_std_dev);
-    data.gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
-
     data.t_ns = t_ns + dt_ns / 2;  // measurement in the middle of the interval;
 
-    imu_meas.integrate(data);
+    imu_meas.integrate(data, accel_cov, gyro_cov);
   }
 
   state1.t_ns = imu_meas.get_dt_ns();
@@ -146,7 +147,7 @@ TEST(PreIntegrationTestSuite, ImuNullspace2Test) {
   EXPECT_LE(std::abs(null_res[5]), 1e-6);
 }
 
-TEST(PreIntegrationTestSuite, ImuNullspace3Test) {
+TEST(VioTestSuite, ImuNullspace3Test) {
   int num_knots = 15;
 
   Eigen::Vector3d bg, ba;
@@ -165,6 +166,10 @@ TEST(PreIntegrationTestSuite, ImuNullspace3Test) {
   state0.vel_w_i = gt_spline.transVelWorld(int64_t(0));
   state0.bias_gyro = bg;
   state0.bias_accel = ba;
+
+  Eigen::Vector3d accel_cov, gyro_cov;
+  accel_cov.setConstant(accel_std_dev * accel_std_dev);
+  gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
 
   int64_t dt_ns = 1e7;
   for (int64_t t_ns = dt_ns / 2;
@@ -188,12 +193,9 @@ TEST(PreIntegrationTestSuite, ImuNullspace3Test) {
     data.gyro[1] += gyro_noise_dist(gen);
     data.gyro[2] += gyro_noise_dist(gen);
 
-    data.accel_cov.setConstant(accel_std_dev * accel_std_dev);
-    data.gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
-
     data.t_ns = t_ns + dt_ns / 2;  // measurement in the middle of the interval;
 
-    imu_meas1.integrate(data);
+    imu_meas1.integrate(data, accel_cov, gyro_cov);
   }
 
   basalt::IntegratedImuMeasurement imu_meas2(imu_meas1.get_dt_ns(), bg, ba);
@@ -218,12 +220,9 @@ TEST(PreIntegrationTestSuite, ImuNullspace3Test) {
     data.gyro[1] += gyro_noise_dist(gen);
     data.gyro[2] += gyro_noise_dist(gen);
 
-    data.accel_cov.setConstant(accel_std_dev * accel_std_dev);
-    data.gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
-
     data.t_ns = t_ns + dt_ns / 2;  // measurement in the middle of the interval;
 
-    imu_meas2.integrate(data);
+    imu_meas2.integrate(data, accel_cov, gyro_cov);
   }
 
   state1.t_ns = imu_meas1.get_dt_ns();
@@ -287,7 +286,7 @@ TEST(PreIntegrationTestSuite, ImuNullspace3Test) {
   EXPECT_LE(std::abs(null_res[5]), 1e-6);
 }
 
-TEST(PreIntegrationTestSuite, RelPoseTest) {
+TEST(VioTestSuite, RelPoseTest) {
   Sophus::SE3d T_w_i_h = Sophus::expd(Sophus::Vector6d::Random());
   Sophus::SE3d T_w_i_t = Sophus::expd(Sophus::Vector6d::Random());
 
@@ -335,11 +334,11 @@ TEST(PreIntegrationTestSuite, RelPoseTest) {
   }
 }
 
-TEST(PreIntegrationTestSuite, LinearizePointsTest) {
+TEST(VioTestSuite, LinearizePointsTest) {
   basalt::ExtendedUnifiedCamera<double> cam =
       basalt::ExtendedUnifiedCamera<double>::getTestProjections()[0];
 
-  basalt::KeypointVioEstimator::KeypointPosition kpt_pos;
+  basalt::KeypointPosition kpt_pos;
 
   Eigen::Vector4d point3d;
   cam.unproject(Eigen::Vector2d::Random() * 50, point3d);
@@ -359,7 +358,7 @@ TEST(PreIntegrationTestSuite, LinearizePointsTest) {
 
   p_trans = T_t_h * p_trans;
 
-  basalt::KeypointVioEstimator::KeypointObservation kpt_obs;
+  basalt::KeypointObservation kpt_obs;
   cam.project(p_trans, kpt_obs.pos);
 
   Eigen::Vector2d res;
@@ -372,37 +371,37 @@ TEST(PreIntegrationTestSuite, LinearizePointsTest) {
   {
     Sophus::Vector6d x0;
     x0.setZero();
-    test_jacobian("d_res_d_xi", d_res_d_xi,
-                  [&](const Sophus::Vector6d& x) {
-                    Eigen::Matrix4d T_t_h_new =
-                        (Sophus::expd(x) * T_t_h_sophus).matrix();
+    test_jacobian(
+        "d_res_d_xi", d_res_d_xi,
+        [&](const Sophus::Vector6d& x) {
+          Eigen::Matrix4d T_t_h_new = (Sophus::expd(x) * T_t_h_sophus).matrix();
 
-                    Eigen::Vector2d res;
-                    basalt::KeypointVioEstimator::linearizePoint(
-                        kpt_obs, kpt_pos, T_t_h_new, cam, res);
+          Eigen::Vector2d res;
+          basalt::KeypointVioEstimator::linearizePoint(kpt_obs, kpt_pos,
+                                                       T_t_h_new, cam, res);
 
-                    return res;
-                  },
-                  x0);
+          return res;
+        },
+        x0);
   }
 
   {
     Eigen::Vector3d x0;
     x0.setZero();
-    test_jacobian("d_res_d_p", d_res_d_p,
-                  [&](const Eigen::Vector3d& x) {
-                    basalt::KeypointVioEstimator::KeypointPosition kpt_pos_new =
-                        kpt_pos;
+    test_jacobian(
+        "d_res_d_p", d_res_d_p,
+        [&](const Eigen::Vector3d& x) {
+          basalt::KeypointPosition kpt_pos_new = kpt_pos;
 
-                    kpt_pos_new.dir += x.head<2>();
-                    kpt_pos_new.id += x[2];
+          kpt_pos_new.dir += x.head<2>();
+          kpt_pos_new.id += x[2];
 
-                    Eigen::Vector2d res;
-                    basalt::KeypointVioEstimator::linearizePoint(
-                        kpt_obs, kpt_pos_new, T_t_h, cam, res);
+          Eigen::Vector2d res;
+          basalt::KeypointVioEstimator::linearizePoint(kpt_obs, kpt_pos_new,
+                                                       T_t_h, cam, res);
 
-                    return res;
-                  },
-                  x0);
+          return res;
+        },
+        x0);
   }
 }

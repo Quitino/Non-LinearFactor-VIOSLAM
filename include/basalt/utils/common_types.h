@@ -48,6 +48,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace basalt {
 
+/// ids for 2D features detected in images
+using FeatureId = int;
+
 /// identifies a frame of multiple images (stereo pair)
 using FrameId = int64_t;
 
@@ -55,14 +58,37 @@ using FrameId = int64_t;
 using CamId = std::size_t;
 
 /// pair of image timestamp and camera id identifies an image (imageId)
-typedef std::pair<FrameId, CamId> TimeCamId;
+struct TimeCamId {
+  TimeCamId() : frame_id(0), cam_id(0) {}
+
+  TimeCamId(const FrameId& frame_id, const CamId& cam_id)
+      : frame_id(frame_id), cam_id(cam_id) {}
+
+  FrameId frame_id;
+  CamId cam_id;
+};
+
 inline std::ostream& operator<<(std::ostream& os, const TimeCamId& tcid) {
-  os << tcid.first << "_" << tcid.second;
+  os << tcid.frame_id << "_" << tcid.cam_id;
   return os;
 }
 
-/// ids for 2D features detected in images
-using FeatureId = int;
+inline bool operator<(const TimeCamId& o1, const TimeCamId& o2) {
+  if (o1.frame_id == o2.frame_id) return o1.cam_id < o2.cam_id;
+  return o1.frame_id < o2.frame_id;
+}
+
+inline bool operator==(const TimeCamId& o1, const TimeCamId& o2) {
+  return o1.frame_id == o2.frame_id && o1.cam_id == o2.cam_id;
+}
+
+inline bool operator!=(const TimeCamId& o1, const TimeCamId& o2) {
+  return o1.frame_id != o2.frame_id || o1.cam_id != o2.cam_id;
+}
+
+constexpr static const size_t FEATURE_HASH_MAX_SIZE = 32;
+using FeatureHash = std::bitset<FEATURE_HASH_MAX_SIZE>;
+using HashBowVector = std::vector<std::pair<FeatureHash, double>>;
 
 /// keypoint positions and descriptors for an image
 struct KeypointsData {
@@ -77,6 +103,9 @@ struct KeypointsData {
   std::vector<std::bitset<256>> corner_descriptors;
 
   Eigen::vector<Eigen::Vector4d> corners_3d;
+
+  std::vector<FeatureHash> hashes;
+  HashBowVector bow_vector;
 };
 
 /// feature corners is a collection of { imageId => KeypointsData }
@@ -238,9 +267,14 @@ using ImageProjections = std::map<TimeCamId, ImageProjection>;
 /// inlier projections indexed per track
 using TrackProjections =
     std::unordered_map<TrackId, std::map<TimeCamId, ProjectedLandmarkConstPtr>>;
-}
+}  // namespace basalt
 
 namespace cereal {
+
+template <class Archive>
+void serialize(Archive& ar, basalt::TimeCamId& c) {
+  ar(c.frame_id, c.cam_id);
+}
 
 template <class Archive>
 void serialize(Archive& ar, basalt::KeypointsData& c) {
@@ -251,4 +285,45 @@ template <class Archive>
 void serialize(Archive& ar, basalt::MatchData& c) {
   ar(c.T_i_j, c.matches, c.inliers);
 }
+}  // namespace cereal
+
+namespace std {
+
+inline void hash_combine(std::size_t& seed, std::size_t value) {
+  seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
+
+template <>
+struct hash<basalt::TimeCamId> {
+  size_t operator()(const basalt::TimeCamId& x) const {
+    size_t seed = 0;
+    hash_combine(seed, std::hash<int>()(x.frame_id));
+    hash_combine(seed, std::hash<int>()(x.cam_id));
+    return seed;
+  }
+};
+
+template <>
+struct hash<std::pair<basalt::TimeCamId, basalt::TimeCamId>> {
+  size_t operator()(
+      const std::pair<basalt::TimeCamId, basalt::TimeCamId>& x) const {
+    size_t seed = 0;
+    hash_combine(seed, std::hash<int>()(x.first.frame_id));
+    hash_combine(seed, std::hash<int>()(x.first.cam_id));
+    hash_combine(seed, std::hash<int>()(x.second.frame_id));
+    hash_combine(seed, std::hash<int>()(x.second.cam_id));
+    return seed;
+  }
+};
+}  // namespace std
+
+namespace tbb {
+
+template <>
+struct tbb_hash<basalt::TimeCamId> : public std::hash<basalt::TimeCamId> {};
+
+template <>
+struct tbb_hash<std::pair<basalt::TimeCamId, basalt::TimeCamId>>
+    : public std::hash<std::pair<basalt::TimeCamId, basalt::TimeCamId>> {};
+
+}  // namespace tbb

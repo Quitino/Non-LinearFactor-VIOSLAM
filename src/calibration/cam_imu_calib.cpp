@@ -45,11 +45,13 @@ namespace basalt {
 
 CamImuCalib::CamImuCalib(const std::string &dataset_path,
                          const std::string &dataset_type,
+                         const std::string &aprilgrid_path,
                          const std::string &cache_path,
                          const std::string &cache_dataset_name, int skip_images,
                          const std::vector<double> &imu_noise, bool show_gui)
     : dataset_path(dataset_path),
       dataset_type(dataset_type),
+      april_grid(aprilgrid_path),
       cache_path(ensure_trailing_slash(cache_path)),
       cache_dataset_name(cache_dataset_name),
       skip_images(skip_images),
@@ -76,7 +78,9 @@ CamImuCalib::CamImuCalib(const std::string &dataset_path,
       opt_cam_time_offset("ui.opt_cam_time_offset", false, false, true),
       opt_imu_scale("ui.opt_imu_scale", false, false, true),
       opt_mocap("ui.opt_mocap", false, false, true),
-      huber_thresh("ui.huber_thresh", 4.0, 0.1, 10.0) {
+      huber_thresh("ui.huber_thresh", 4.0, 0.1, 10.0),
+      opt_until_convg("ui.opt_until_converge", false, false, true),
+      stop_thresh("ui.stop_thresh", 1e-8, 1e-10, 0.01, true) {
   if (show_gui) initGui();
 }
 
@@ -184,6 +188,11 @@ void CamImuCalib::renderingLoop() {
       }
     }
 
+    if (opt_until_convg) {
+      bool converged = optimizeWithParam(true);
+      if (converged) opt_until_convg = false;
+    }
+
     pangolin::FinishFrame();
   }
 }
@@ -204,9 +213,9 @@ void CamImuCalib::computeProjections() {
       continue;
 
     for (size_t i = 0; i < calib_opt->calib->intrinsics.size(); i++) {
-      TimeCamId tcid = std::make_pair(timestamp_ns, i);
+      TimeCamId tcid(timestamp_ns, i);
 
-      Eigen::vector<Eigen::Vector2d> rc;
+      ProjectedCornerData rc;
 
       Sophus::SE3d T_c_w_ = (calib_opt->getT_w_i(timestamp_corrected_ns) *
                              calib_opt->getCamT_i_c(i))
@@ -214,11 +223,9 @@ void CamImuCalib::computeProjections() {
 
       Eigen::Matrix4d T_c_w = T_c_w_.matrix();
 
-      rc.resize(april_grid.aprilgrid_corner_pos_3d.size());
-
-      std::vector<bool> proj_success;
       calib_opt->calib->intrinsics[i].project(
-          april_grid.aprilgrid_corner_pos_3d, T_c_w, rc, proj_success);
+          april_grid.aprilgrid_corner_pos_3d, T_c_w, rc.corners_proj,
+          rc.corners_proj_success);
 
       reprojected_corners.emplace(tcid, rc);
     }
@@ -277,7 +284,7 @@ void CamImuCalib::initCamPoses() {
   {
     std::cout << "Started initial camera pose computation " << std::endl;
 
-    CalibHelper::initCamPoses(calib_opt->calib, this->vio_dataset,
+    CalibHelper::initCamPoses(calib_opt->calib,
                               april_grid.aprilgrid_corner_pos_3d,
                               this->calib_corners, this->calib_init_poses);
 
@@ -315,8 +322,8 @@ void CamImuCalib::initCamImuTransform() {
     int64_t timestamp0_ns = vio_dataset->get_image_timestamps()[i - 1];
     int64_t timestamp1_ns = vio_dataset->get_image_timestamps()[i];
 
-    TimeCamId tcid0 = std::make_pair(timestamp0_ns, 0);
-    TimeCamId tcid1 = std::make_pair(timestamp1_ns, 0);
+    TimeCamId tcid0(timestamp0_ns, 0);
+    TimeCamId tcid1(timestamp1_ns, 0);
 
     if (calib_init_poses.find(tcid0) == calib_init_poses.end()) continue;
     if (calib_init_poses.find(tcid1) == calib_init_poses.end()) continue;
@@ -413,12 +420,12 @@ void CamImuCalib::initOptimization() {
   std::set<uint64_t> invalid_timestamps;
   for (const auto &kv : calib_corners) {
     if (kv.second.corner_ids.size() < MIN_CORNERS)
-      invalid_timestamps.insert(kv.first.first);
+      invalid_timestamps.insert(kv.first.frame_id);
   }
 
   for (const auto &kv : calib_corners) {
-    if (invalid_timestamps.find(kv.first.first) == invalid_timestamps.end())
-      calib_opt->addAprilgridMeasurement(kv.first.first, kv.first.second,
+    if (invalid_timestamps.find(kv.first.frame_id) == invalid_timestamps.end())
+      calib_opt->addAprilgridMeasurement(kv.first.frame_id, kv.first.cam_id,
                                          kv.second.corners,
                                          kv.second.corner_ids);
   }
@@ -434,21 +441,24 @@ void CamImuCalib::initOptimization() {
   for (size_t j = 0; j < vio_dataset->get_image_timestamps().size(); ++j) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[j];
 
-    TimeCamId tcid = std::make_pair(timestamp_ns, 0);
-    const CalibInitPoseData &cp = calib_init_poses.at(tcid);
+    TimeCamId tcid(timestamp_ns, 0);
+    const auto cp_it = calib_init_poses.find(tcid);
 
-    calib_opt->addPoseMeasurement(
-        timestamp_ns, cp.T_a_c * calib_opt->getCamT_i_c(0).inverse());
+    if (cp_it != calib_init_poses.end()) {
+      calib_opt->addPoseMeasurement(
+          timestamp_ns,
+          cp_it->second.T_a_c * calib_opt->getCamT_i_c(0).inverse());
 
-    if (!g_initialized) {
-      for (size_t i = 0;
-           i < vio_dataset->get_accel_data().size() && !g_initialized; i++) {
-        const basalt::AccelData &ad = vio_dataset->get_accel_data()[i];
-        if (std::abs(ad.timestamp_ns - timestamp_ns) < 3000000) {
-          g_a_init = cp.T_a_c.so3() * ad.data;
-          g_initialized = true;
-          std::cout << "g_a initialized with " << g_a_init.transpose()
-                    << std::endl;
+      if (!g_initialized) {
+        for (size_t i = 0;
+             i < vio_dataset->get_accel_data().size() && !g_initialized; i++) {
+          const basalt::AccelData &ad = vio_dataset->get_accel_data()[i];
+          if (std::abs(ad.timestamp_ns - timestamp_ns) < 3000000) {
+            g_a_init = cp_it->second.T_a_c.so3() * ad.data;
+            g_initialized = true;
+            std::cout << "g_a initialized with " << g_a_init.transpose()
+                      << std::endl;
+          }
         }
       }
     }
@@ -480,6 +490,83 @@ void CamImuCalib::initMocap() {
     return;
   }
 
+  {
+    std::vector<int64_t> timestamps_cam;
+    Eigen::vector<Eigen::Vector3d> rot_vel_mocap;
+    Eigen::vector<Eigen::Vector3d> rot_vel_imu;
+
+    Sophus::SO3d R_i_mark_init = calib_opt->mocap_calib->T_i_mark.so3();
+
+    for (size_t i = 1; i < vio_dataset->get_gt_timestamps().size(); i++) {
+      int64_t timestamp0_ns = vio_dataset->get_gt_timestamps()[i - 1];
+      int64_t timestamp1_ns = vio_dataset->get_gt_timestamps()[i];
+
+      Sophus::SE3d T_a_mark0 = vio_dataset->get_gt_pose_data()[i - 1];
+      Sophus::SE3d T_a_mark1 = vio_dataset->get_gt_pose_data()[i];
+
+      double dt = (timestamp1_ns - timestamp0_ns) * 1e-9;
+
+      Eigen::Vector3d rot_vel_c0 =
+          R_i_mark_init * (T_a_mark0.so3().inverse() * T_a_mark1.so3()).log() /
+          dt;
+
+      timestamps_cam.push_back(timestamp0_ns);
+      rot_vel_mocap.push_back(rot_vel_c0);
+    }
+
+    for (size_t j = 0; j < timestamps_cam.size(); j++) {
+      int idx = -1;
+      int64_t min_dist = std::numeric_limits<int64_t>::max();
+
+      for (size_t i = 1; i < vio_dataset->get_gyro_data().size(); i++) {
+        int64_t dist =
+            vio_dataset->get_gyro_data()[i].timestamp_ns - timestamps_cam[j];
+        if (std::abs(dist) < min_dist) {
+          min_dist = std::abs(dist);
+          idx = i;
+        }
+      }
+
+      rot_vel_imu.push_back(vio_dataset->get_gyro_data()[idx].data);
+    }
+
+    BASALT_ASSERT_STREAM(rot_vel_mocap.size() == rot_vel_imu.size(),
+                         "rot_vel_cam.size() " << rot_vel_mocap.size()
+                                               << " rot_vel_imu.size() "
+                                               << rot_vel_imu.size());
+
+    //  R_i_c * rot_vel_mocap = rot_vel_imu
+    //  R_i_c * rot_vel_mocap * rot_vel_mocap.T = rot_vel_imu * rot_vel_mocap.T
+    //  R_i_c  = rot_vel_imu * rot_vel_mocap.T * (rot_vel_mocap *
+    //  rot_vel_mocap.T)^-1;
+
+    Eigen::Matrix<double, 3, Eigen::Dynamic> rot_vel_mocap_m(
+        3, rot_vel_mocap.size()),
+        rot_vel_imu_m(3, rot_vel_imu.size());
+
+    for (size_t i = 0; i < rot_vel_mocap.size(); i++) {
+      rot_vel_mocap_m.col(i) = rot_vel_mocap[i];
+      rot_vel_imu_m.col(i) = rot_vel_imu[i];
+    }
+
+    Eigen::Matrix3d R_i_mark =
+        rot_vel_imu_m * rot_vel_mocap_m.transpose() *
+        (rot_vel_mocap_m * rot_vel_mocap_m.transpose()).inverse();
+
+    // std::cout << "raw R_i_c0\n" << R_i_c0 << std::endl;
+
+    Eigen::AngleAxisd aa(R_i_mark);  // RotationMatrix to AxisAngle
+    R_i_mark = aa.toRotationMatrix();
+
+    Sophus::SE3d T_i_mark_new(R_i_mark, Eigen::Vector3d::Zero());
+    calib_opt->mocap_calib->T_i_mark =
+        T_i_mark_new * calib_opt->mocap_calib->T_i_mark;
+
+    std::cout << "Initialized T_i_mark:\n"
+              << calib_opt->mocap_calib->T_i_mark.matrix() << std::endl;
+  }
+
+  // Initialize T_w_moc;
   Sophus::SE3d T_w_moc;
 
   // TODO: check for failure cases..
@@ -487,6 +574,7 @@ void CamImuCalib::initMocap() {
        i < vio_dataset->get_gt_timestamps().size(); i++) {
     int64_t timestamp_ns = vio_dataset->get_gt_timestamps()[i];
     T_w_moc = calib_opt->getT_w_i(timestamp_ns) *
+              calib_opt->mocap_calib->T_i_mark *
               vio_dataset->get_gt_pose_data()[i].inverse();
 
     std::cout << "Initialized T_w_moc:\n" << T_w_moc.matrix() << std::endl;
@@ -494,6 +582,8 @@ void CamImuCalib::initMocap() {
   }
 
   calib_opt->setT_w_moc(T_w_moc);
+  calib_opt->mocap_initialized = true;
+
   recomputeDataLog();
 }
 
@@ -561,10 +651,10 @@ void CamImuCalib::loadDataset() {
 
     calib_opt->loadCalib(cache_path);
 
-    calib_opt->calib->accel_noise_std = imu_noise[0];
-    calib_opt->calib->gyro_noise_std = imu_noise[1];
-    calib_opt->calib->accel_bias_std = imu_noise[2];
-    calib_opt->calib->gyro_bias_std = imu_noise[3];
+    calib_opt->calib->accel_noise_std.setConstant(imu_noise[0]);
+    calib_opt->calib->gyro_noise_std.setConstant(imu_noise[1]);
+    calib_opt->calib->accel_bias_std.setConstant(imu_noise[2]);
+    calib_opt->calib->gyro_bias_std.setConstant(imu_noise[3]);
   }
   calib_opt->resetMocapCalib();
 
@@ -584,12 +674,14 @@ void CamImuCalib::loadDataset() {
 
 void CamImuCalib::optimize() { optimizeWithParam(true); }
 
-void CamImuCalib::optimizeWithParam(bool print_info,
+bool CamImuCalib::optimizeWithParam(bool print_info,
                                     std::map<std::string, double> *stats) {
   if (!calib_opt.get() || !calib_opt->calibInitialized()) {
     std::cerr << "Initalize optimization first!" << std::endl;
-    return;
+    return true;
   }
+
+  bool converged = true;
 
   if (calib_opt) {
     // calib_opt->compute_projections();
@@ -599,9 +691,10 @@ void CamImuCalib::optimizeWithParam(bool print_info,
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    calib_opt->optimize(opt_intr, opt_poses, opt_corners, opt_cam_time_offset,
-                        opt_imu_scale, opt_mocap, huber_thresh, error,
-                        num_points, reprojection_error);
+    converged = calib_opt->optimize(opt_intr, opt_poses, opt_corners,
+                                    opt_cam_time_offset, opt_imu_scale,
+                                    opt_mocap, huber_thresh, stop_thresh, error,
+                                    num_points, reprojection_error);
 
     auto finish = std::chrono::high_resolution_clock::now();
 
@@ -670,6 +763,8 @@ void CamImuCalib::optimizeWithParam(bool print_info,
                        .count()
                 << "ms." << std::endl;
 
+      if (converged) std::cout << "Optimization Converged !!" << std::endl;
+
       std::cout << "==================================" << std::endl;
     }
 
@@ -683,6 +778,8 @@ void CamImuCalib::optimizeWithParam(bool print_info,
       drawPlots();
     }
   }
+
+  return converged;
 }
 
 void CamImuCalib::saveCalib() {
@@ -711,7 +808,7 @@ void CamImuCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
 
   if (vio_dataset && frame_id < vio_dataset->get_image_timestamps().size()) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[frame_id];
-    TimeCamId tcid = std::make_pair(timestamp_ns, cam_id);
+    TimeCamId tcid(timestamp_ns, cam_id);
 
     if (show_corners) {
       glLineWidth(1.0);
@@ -795,11 +892,14 @@ void CamImuCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
       if (reprojected_corners.find(tcid) != reprojected_corners.end()) {
-        if (calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
+        if (calib_corners.count(tcid) > 0 &&
+            calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
           const auto &rc = reprojected_corners.at(tcid);
 
-          for (size_t i = 0; i < rc.size(); i++) {
-            Eigen::Vector2d c = rc[i];
+          for (size_t i = 0; i < rc.corners_proj.size(); i++) {
+            if (!rc.corners_proj_success[i]) continue;
+
+            Eigen::Vector2d c = rc.corners_proj[i];
             pangolin::glDrawCirclePerimeter(c[0], c[1], 3.0);
 
             if (show_ids) pangolin::GlFont::I().Text("%d", i).Draw(c[0], c[1]);
@@ -854,7 +954,7 @@ void CamImuCalib::recomputeDataLog() {
   for (size_t i = 0; i < vio_dataset->get_image_timestamps().size(); i++) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[i];
 
-    TimeCamId tcid = std::make_pair(timestamp_ns, 0);
+    TimeCamId tcid(timestamp_ns, 0);
     const auto &it = calib_init_poses.find(tcid);
 
     double t = timestamp_ns * 1e-9 - min_time;

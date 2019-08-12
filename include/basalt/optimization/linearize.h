@@ -40,8 +40,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/calibration/calibration.hpp>
 #include <basalt/camera/stereographic_param.hpp>
 
-#include <pangolin/image/managed_image.h>
-
 #include <tbb/tbb.h>
 
 namespace basalt {
@@ -124,8 +122,8 @@ struct LinearizeBase {
     bool opt_imu_scale;
 
     Scalar pose_var_inv;
-    Scalar gyro_var_inv;
-    Scalar accel_var_inv;
+    Vector3 gyro_var_inv;
+    Vector3 accel_var_inv;
     Scalar mocap_var_inv;
 
     Scalar huber_thresh;
@@ -136,11 +134,10 @@ struct LinearizeBase {
   template <class CamT>
   inline void linearize_point(const Eigen::Vector2d& corner_pos, int corner_id,
                               const Eigen::Matrix4d& T_c_w, const CamT& cam,
-                              PoseCalibH<CamT::N>& cph, double& error,
+                              PoseCalibH<CamT::N>* cph, double& error,
                               int& num_points, double& reproj_err) const {
     Eigen::Matrix<double, 2, 4> d_r_d_p;
     Eigen::Matrix<double, 2, CamT::N> d_r_d_param;
-    Eigen::Matrix<double, 4, 6> d_point_d_xi;
 
     BASALT_ASSERT_STREAM(
         corner_id < int(common_data.aprilgrid_corner_pos_3d->size()),
@@ -149,28 +146,39 @@ struct LinearizeBase {
     Eigen::Vector4d point3d =
         T_c_w * common_data.aprilgrid_corner_pos_3d->at(corner_id);
 
-    d_point_d_xi.topLeftCorner<3, 3>().setIdentity();
-    d_point_d_xi.topRightCorner<3, 3>() = -Sophus::SO3d::hat(point3d.head<3>());
-    d_point_d_xi.row(3).setZero();
-
     Eigen::Vector2d proj;
-    bool valid = cam.project(point3d, proj, &d_r_d_p, &d_r_d_param);
+    bool valid;
+    if (cph) {
+      valid = cam.project(point3d, proj, &d_r_d_p, &d_r_d_param);
+    } else {
+      valid = cam.project(point3d, proj);
+    }
+    if (!valid || !proj.array().isFinite().all()) return;
 
-    if (!valid) return;
-
-    Eigen::Matrix<double, 2, 6> d_r_d_xi = d_r_d_p * d_point_d_xi;
     Eigen::Vector2d residual = proj - corner_pos;
 
     double e = residual.norm();
     double huber_weight =
         e < common_data.huber_thresh ? 1.0 : common_data.huber_thresh / e;
 
-    cph.H_pose_accum += huber_weight * d_r_d_xi.transpose() * d_r_d_xi;
-    cph.b_pose_accum += huber_weight * d_r_d_xi.transpose() * residual;
+    if (cph) {
+      Eigen::Matrix<double, 4, 6> d_point_d_xi;
 
-    cph.H_intr_pose_accum += huber_weight * d_r_d_param.transpose() * d_r_d_xi;
-    cph.H_intr_accum += huber_weight * d_r_d_param.transpose() * d_r_d_param;
-    cph.b_intr_accum += huber_weight * d_r_d_param.transpose() * residual;
+      d_point_d_xi.topLeftCorner<3, 3>().setIdentity();
+      d_point_d_xi.topRightCorner<3, 3>() =
+          -Sophus::SO3d::hat(point3d.head<3>());
+      d_point_d_xi.row(3).setZero();
+
+      Eigen::Matrix<double, 2, 6> d_r_d_xi = d_r_d_p * d_point_d_xi;
+
+      cph->H_pose_accum += huber_weight * d_r_d_xi.transpose() * d_r_d_xi;
+      cph->b_pose_accum += huber_weight * d_r_d_xi.transpose() * residual;
+
+      cph->H_intr_pose_accum +=
+          huber_weight * d_r_d_param.transpose() * d_r_d_xi;
+      cph->H_intr_accum += huber_weight * d_r_d_param.transpose() * d_r_d_param;
+      cph->b_intr_accum += huber_weight * d_r_d_param.transpose() * residual;
+    }
 
     error += huber_weight * e * e * (2 - huber_weight);
     reproj_err += e;

@@ -42,14 +42,17 @@ The buttons in the GUI have the following meaning:
 
 By default the system starts with `continue_fast` enabled. This option visualizes the latest processed frame until the end of the sequence. Alternatively, the `continue` visualizes every frame without skipping. If both options are disabled the system shows the frame that is selected with the `show_frame` slider and the user can move forward and backward with `next_step` and `prev_step` buttons. The `follow` button changes between the static camera and the camera attached to the current frame.
 
-For evaluation the button `align_svd` is used. It aligns the GT trajectory with the current estimate using an SE(3) transformation and prints the transformation and the root-mean-squared absolute trajectory error (RMS ATE).
+For evaluation the button `align_se3` is used. It aligns the GT trajectory with the current estimate using an SE(3) transformation and prints the transformation and the root-mean-squared absolute trajectory error (RMS ATE).
+
+The button `save_traj` saves the trajectory in one of two formats (`euroc_fmt` or `tum_rgbd_fmt`). In EuRoC format each pose is a line in the file and has the following format `timestamp[ns],tx,ty,tz,qw,qx,qy,qz`. TUM RBG-D can be used with [TUM RGB-D](https://vision.in.tum.de/data/datasets/rgbd-dataset/tools) or [UZH](https://github.com/uzh-rpg/rpg_trajectory_evaluation) trajectory evaluation tools and has the following format `timestamp[s] tx ty tz qx qy qz qw`. 
+
 
 ### Visual-inertial mapping
 To run the mapping tool execute the following command:
 ```
-basalt_mapper --cam-calib /usr/etc/basalt/euroc_ds_calib.json --marg-data euroc_marg_data --vocabulary /usr/etc/basalt/orbvoc.dbow3
+basalt_mapper --cam-calib /usr/etc/basalt/euroc_ds_calib.json --marg-data euroc_marg_data
 ```
-Here `--marg-data` is the folder with the results from VIO and `--vocabulary` is the path to DBoW3 vocabulary.
+Here `--marg-data` is the folder with the results from VIO.
 
 This opens the GUI and extracts non-linear factors from the marginalization data.
 ![MH_05_MAPPING](/doc/img/MH_05_MAPPING.png)
@@ -69,10 +72,11 @@ The workflow for the mapping is the following:
 * `match` run the geometric 2D to 2D matching between image frames.
 * `tracks` build tracks from 2D matches and triangulate the points.
 * `optimize` run the optimization.
-* `align_svd` align ground-truth trajectory in SE(3) and print the transformation and the error.
+* `align_se3` align ground-truth trajectory in SE(3) and print the transformation and the error.
 
 The `num_opt_iter` slider controls the maximum number of iterations executed when pressing `optimize`.
 
+The button `save_traj` works similar to the VIO, but saves the keyframe trajectory (subset of frames).
 
 For more systematic evaluation see the evaluation scripts in the [scripts/eval_full](/scripts/eval_full) folder.
 
@@ -112,6 +116,6 @@ basalt_vio --dataset-path dataset-magistrale1_512_16/ --cam-calib /usr/etc/basal
 ### Visual-inertial mapping
 To run the mapping tool execute the following command:
 ```
-basalt_mapper --cam-calib /usr/etc/basalt/tumvi_512_ds_calib.json --marg-data tumvi_marg_data --vocabulary /usr/etc/basalt/orbvoc.dbow3
+basalt_mapper --cam-calib /usr/etc/basalt/tumvi_512_ds_calib.json --marg-data tumvi_marg_data
 ```
 ![magistrale1_mapping](/doc/img/magistrale1_mapping.png)

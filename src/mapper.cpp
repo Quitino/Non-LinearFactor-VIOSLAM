@@ -108,6 +108,8 @@ void detect();
 void match();
 void tracks();
 void optimize();
+void filter();
+void saveTrajectoryButton();
 
 constexpr int UI_WIDTH = 200;
 
@@ -135,12 +137,19 @@ Button detect_btn("ui.detect", &detect);
 Button match_btn("ui.match", &match);
 Button tracks_btn("ui.tracks", &tracks);
 Button optimize_btn("ui.optimize", &optimize);
-Button align_btn("ui.aling_svd", &alignButton);
+
+pangolin::Var<double> outlier_threshold("ui.outlier_threshold", 3.0, 0.01, 10);
+
+Button filter_btn("ui.filter", &filter);
+Button align_btn("ui.aling_se3", &alignButton);
+
+pangolin::Var<bool> euroc_fmt("ui.euroc_fmt", true, false, true);
+pangolin::Var<bool> tum_rgbd_fmt("ui.tum_rgbd_fmt", false, false, true);
+Button save_traj_btn("ui.save_traj", &saveTrajectoryButton);
 
 pangolin::OpenGlRenderState camera;
 
 std::string marg_data_path;
-std::string vocabulary;
 
 int main(int argc, char** argv) {
   bool show_gui = true;
@@ -159,8 +168,6 @@ int main(int argc, char** argv) {
       ->required();
 
   app.add_option("--config-path", config_path, "Path to config file.");
-
-  app.add_option("--vocabulary", vocabulary, "Path to vocabulary.")->required();
 
   app.add_option("--result-path", result_path, "Path to config file.");
 
@@ -291,6 +298,14 @@ int main(int argc, char** argv) {
         }
       }
 
+      if (euroc_fmt.GuiChanged()) {
+        tum_rgbd_fmt = !euroc_fmt;
+      }
+
+      if (tum_rgbd_fmt.GuiChanged()) {
+        euroc_fmt = !tum_rgbd_fmt;
+      }
+
       if (show_frame2.GuiChanged() || show_cam2.GuiChanged()) {
         size_t frame_id = static_cast<size_t>(show_frame2);
         int64_t timestamp = image_t_ns[frame_id];
@@ -323,17 +338,30 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   } else {
-    //optimize();
+    auto time_start = std::chrono::high_resolution_clock::now();
+    // optimize();
     detect();
     match();
     tracks();
     optimize();
+    filter();
+    optimize();
+
+    auto time_end = std::chrono::high_resolution_clock::now();
 
     if (!result_path.empty()) {
       double error = alignButton();
 
+      auto exec_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          time_end - time_start);
+
       std::ofstream os(result_path);
-      os << error << std::endl;
+      {
+        cereal::JSONOutputArchive ar(os);
+        ar(cereal::make_nvp("rms_ate", error));
+        ar(cereal::make_nvp("num_frames", nrf_mapper->getFramePoses().size()));
+        ar(cereal::make_nvp("exec_time_ns", exec_time_ns.count()));
+      }
       os.close();
     }
   }
@@ -342,10 +370,12 @@ int main(int argc, char** argv) {
 }
 
 void draw_image_overlay(pangolin::View& v, size_t view_id) {
+  UNUSED(v);
+
   size_t frame_id = (view_id == 0) ? show_frame1 : show_frame2;
   size_t cam_id = (view_id == 0) ? show_cam1 : show_cam2;
 
-  basalt::TimeCamId tcid = std::make_pair(image_t_ns[frame_id], cam_id);
+  basalt::TimeCamId tcid(image_t_ns[frame_id], cam_id);
 
   float text_row = 20;
 
@@ -392,7 +422,7 @@ void draw_image_overlay(pangolin::View& v, size_t view_id) {
     size_t o_frame_id = (view_id == 0 ? show_frame2 : show_frame1);
     size_t o_cam_id = (view_id == 0 ? show_cam2 : show_cam1);
 
-    basalt::TimeCamId o_tcid = std::make_pair(image_t_ns[o_frame_id], o_cam_id);
+    basalt::TimeCamId o_tcid(image_t_ns[o_frame_id], o_cam_id);
 
     int idx = -1;
 
@@ -537,7 +567,7 @@ void load_data(const std::string& calib_path, const std::string& cache_path) {
     }
   }
 
-  nrf_mapper.reset(new basalt::NfrMapper(calib, vio_config, vocabulary));
+  nrf_mapper.reset(new basalt::NfrMapper(calib, vio_config));
 
   basalt::MargDataLoader mdl;
   tbb::concurrent_bounded_queue<basalt::MargData::Ptr> marg_queue;
@@ -563,14 +593,14 @@ void load_data(const std::string& calib_path, const std::string& cache_path) {
 
 void computeEdgeVis() {
   edges_vis.clear();
-  for (const auto& kv1 : nrf_mapper->obs) {
+  for (const auto& kv1 : nrf_mapper->lmdb.getObservations()) {
     for (const auto& kv2 : kv1.second) {
       Eigen::Vector3d p1 = nrf_mapper->getFramePoses()
-                               .at(kv1.first.first)
+                               .at(kv1.first.frame_id)
                                .getPose()
                                .translation();
       Eigen::Vector3d p2 = nrf_mapper->getFramePoses()
-                               .at(kv2.first.first)
+                               .at(kv2.first.frame_id)
                                .getPose()
                                .translation();
 
@@ -644,4 +674,53 @@ void tracks() {
   //  mapper_points_color,
   //                                            mapper_point_ids);
   computeEdgeVis();
+}
+
+void filter() {
+  nrf_mapper->filterOutliers(outlier_threshold, 4);
+  nrf_mapper->get_current_points(mapper_points, mapper_point_ids);
+}
+
+void saveTrajectoryButton() {
+  if (tum_rgbd_fmt) {
+    std::ofstream os("keyframeTrajectory.txt");
+
+    os << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+
+    for (const auto& kv : nrf_mapper->getFramePoses()) {
+      const Sophus::SE3d pose = kv.second.getPose();
+      os << std::scientific << std::setprecision(18) << kv.first * 1e-9 << " "
+         << pose.translation().x() << " " << pose.translation().y() << " "
+         << pose.translation().z() << " " << pose.unit_quaternion().x() << " "
+         << pose.unit_quaternion().y() << " " << pose.unit_quaternion().z()
+         << " " << pose.unit_quaternion().w() << std::endl;
+    }
+
+    os.close();
+
+    std::cout << "Saved trajectory in TUM RGB-D Dataset format in "
+                 "keyframeTrajectory.txt"
+              << std::endl;
+  } else {
+    std::ofstream os("keyframeTrajectory.csv");
+
+    os << "#timestamp [ns],p_RS_R_x [m],p_RS_R_y [m],p_RS_R_z [m],q_RS_w "
+          "[],q_RS_x [],q_RS_y [],q_RS_z []"
+       << std::endl;
+
+    for (const auto& kv : nrf_mapper->getFramePoses()) {
+      const Sophus::SE3d pose = kv.second.getPose();
+      os << std::scientific << std::setprecision(18) << kv.first << ","
+         << pose.translation().x() << "," << pose.translation().y() << ","
+         << pose.translation().z() << "," << pose.unit_quaternion().w() << ","
+         << pose.unit_quaternion().x() << "," << pose.unit_quaternion().y()
+         << "," << pose.unit_quaternion().z() << std::endl;
+    }
+
+    os.close();
+
+    std::cout
+        << "Saved trajectory in Euroc Dataset format in keyframeTrajectory.csv"
+        << std::endl;
+  }
 }

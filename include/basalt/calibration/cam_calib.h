@@ -60,9 +60,9 @@ class PosesOptimization;
 class CamCalib {
  public:
   CamCalib(const std::string &dataset_path, const std::string &dataset_type,
-           const std::string &cache_path, const std::string &cache_dataset_name,
-           int skip_images, const std::vector<std::string> &cam_types,
-           bool show_gui = true);
+           const std::string &aprilgrid_path, const std::string &cache_path,
+           const std::string &cache_dataset_name, int skip_images,
+           const std::vector<std::string> &cam_types, bool show_gui = true);
 
   ~CamCalib();
 
@@ -90,7 +90,7 @@ class CamCalib {
 
   void optimize();
 
-  void optimizeWithParam(bool print_info,
+  bool optimizeWithParam(bool print_info,
                          std::map<std::string, double> *stats = nullptr);
 
   void saveCalib();
@@ -108,8 +108,6 @@ class CamCalib {
 
   // typedef Calibration::Ptr CalibrationPtr;
 
-  AprilGrid april_grid;
-
   VioDatasetPtr vio_dataset;
   // CalibrationPtr calib;
 
@@ -122,12 +120,15 @@ class CamCalib {
 
   std::shared_ptr<PosesOptimization> calib_opt;
 
-  std::map<TimeCamId, Eigen::vector<Eigen::Vector2d>> reprojected_corners;
-  std::map<TimeCamId, Eigen::vector<Eigen::Vector2d>> reprojected_vignette;
+  std::map<TimeCamId, ProjectedCornerData> reprojected_corners;
+  std::map<TimeCamId, ProjectedCornerData> reprojected_vignette;
   std::map<TimeCamId, std::vector<double>> reprojected_vignette_error;
 
   std::string dataset_path;
   std::string dataset_type;
+
+  AprilGrid april_grid;
+
   std::string cache_path;
   std::string cache_dataset_name;
 
@@ -154,12 +155,23 @@ class CamCalib {
 
   pangolin::Var<bool> opt_intr;
 
+  pangolin::Var<bool> opt_until_convg;
+  pangolin::Var<double> stop_thresh;
+
   std::shared_ptr<pangolin::Plotter> vign_plotter;
+  std::shared_ptr<pangolin::Plotter> polar_plotter;
+  std::shared_ptr<pangolin::Plotter> azimuth_plotter;
+
+  std::vector<pangolin::Colour> cam_colors;
+
   pangolin::View *img_view_display;
 
   std::vector<std::shared_ptr<pangolin::ImageView>> img_view;
 
   pangolin::DataLog vign_data_log;
+
+  std::vector<std::shared_ptr<pangolin::DataLog>> polar_data_log,
+      azimuth_data_log;
 };
 
 }  // namespace basalt

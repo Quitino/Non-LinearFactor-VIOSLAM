@@ -61,7 +61,7 @@ class SplineOptimization;
 class CamImuCalib {
  public:
   CamImuCalib(const std::string &dataset_path, const std::string &dataset_type,
-              const std::string &cache_path,
+              const std::string &aprilgrid_path, const std::string &cache_path,
               const std::string &cache_dataset_name, int skip_images,
               const std::vector<double> &imu_noise, bool show_gui = true);
 
@@ -89,7 +89,7 @@ class CamImuCalib {
 
   void optimize();
 
-  void optimizeWithParam(bool print_info,
+  bool optimizeWithParam(bool print_info,
                          std::map<std::string, double> *stats = nullptr);
 
   void saveCalib();
@@ -109,8 +109,6 @@ class CamImuCalib {
  private:
   static constexpr int UI_WIDTH = 300;
 
-  AprilGrid april_grid;
-
   VioDatasetPtr vio_dataset;
 
   tbb::concurrent_unordered_map<TimeCamId, CalibCornerData> calib_corners;
@@ -122,10 +120,13 @@ class CamImuCalib {
 
   std::shared_ptr<SplineOptimization<5, double>> calib_opt;
 
-  std::map<TimeCamId, Eigen::vector<Eigen::Vector2d>> reprojected_corners;
+  std::map<TimeCamId, ProjectedCornerData> reprojected_corners;
 
   std::string dataset_path;
   std::string dataset_type;
+
+  AprilGrid april_grid;
+
   std::string cache_path;
   std::string cache_dataset_name;
 
@@ -168,6 +169,9 @@ class CamImuCalib {
   pangolin::Var<bool> opt_mocap;
 
   pangolin::Var<double> huber_thresh;
+
+  pangolin::Var<bool> opt_until_convg;
+  pangolin::Var<double> stop_thresh;
 
   pangolin::Plotter *plotter;
   pangolin::View *img_view_display;

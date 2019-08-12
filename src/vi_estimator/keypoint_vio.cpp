@@ -47,24 +47,22 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 namespace basalt {
 
 KeypointVioEstimator::KeypointVioEstimator(
-    int64_t t_ns, const Sophus::SE3d& T_w_i, const Eigen::Vector3d& vel_w_i,
-    const Eigen::Vector3d& bg, const Eigen::Vector3d& ba, double int_std_dev,
-    const Eigen::Vector3d& g, const basalt::Calibration<double>& calib,
-    const VioConfig& config)
-    : take_kf(true), frames_after_kf(0), g(g), config(config) {
+    double int_std_dev, const Eigen::Vector3d& g,
+    const basalt::Calibration<double>& calib, const VioConfig& config)
+    : take_kf(true),
+      frames_after_kf(0),
+      g(g),
+      initialized(false),
+      config(config) {
   this->obs_std_dev = config.vio_obs_std_dev;
   this->huber_thresh = config.vio_obs_huber_thresh;
   this->calib = calib;
 
-  last_state_t_ns = t_ns;
-
-  imu_meas[t_ns] = IntegratedImuMeasurement(t_ns, bg, ba);
-  frame_states[t_ns] =
-      PoseVelBiasStateWithLin(t_ns, T_w_i, vel_w_i, bg, ba, true);
-
   // Setup marginalization
   marg_H.setZero(POSE_VEL_BIAS_SIZE, POSE_VEL_BIAS_SIZE);
   marg_b.setZero(POSE_VEL_BIAS_SIZE);
+
+  double prior_weight = 1.0 / (int_std_dev * int_std_dev);
 
   // prior on position
   marg_H.diagonal().head<3>().setConstant(prior_weight);
@@ -72,19 +70,13 @@ KeypointVioEstimator::KeypointVioEstimator(
   marg_H(5, 5) = prior_weight;
 
   // small prior to avoid jumps in bias
-  marg_H.diagonal().segment<3>(9).array() = 1e1;
-  marg_H.diagonal().segment<3>(12).array() = 1e2;
+  marg_H.diagonal().segment<3>(9).array() = 1e2;
+  marg_H.diagonal().segment<3>(12).array() = 1e3;
 
   std::cout << "marg_H\n" << marg_H << std::endl;
 
-  marg_order.abs_order_map[t_ns] = std::make_pair(0, POSE_VEL_BIAS_SIZE);
-  marg_order.total_size = POSE_VEL_BIAS_SIZE;
-  marg_order.items = 1;
-
-  gyro_bias_weight.setConstant(1.0 /
-                               (calib.gyro_bias_std * calib.gyro_bias_std));
-  accel_bias_weight.setConstant(1.0 /
-                                (calib.accel_bias_std * calib.accel_bias_std));
+  gyro_bias_weight = calib.gyro_bias_std.array().square().inverse();
+  accel_bias_weight = calib.accel_bias_std.array().square().inverse();
 
   max_states = std::numeric_limits<int>::max();
   max_kfs = std::numeric_limits<int>::max();
@@ -93,19 +85,89 @@ KeypointVioEstimator::KeypointVioEstimator(
 
   vision_data_queue.set_capacity(10);
   imu_data_queue.set_capacity(300);
+}
 
-  auto proc_func = [&] {
+void KeypointVioEstimator::initialize(int64_t t_ns, const Sophus::SE3d& T_w_i,
+                                      const Eigen::Vector3d& vel_w_i,
+                                      const Eigen::Vector3d& bg,
+                                      const Eigen::Vector3d& ba) {
+  initialized = true;
+  T_w_i_init = T_w_i;
+
+  last_state_t_ns = t_ns;
+  imu_meas[t_ns] = IntegratedImuMeasurement(t_ns, bg, ba);
+  frame_states[t_ns] =
+      PoseVelBiasStateWithLin(t_ns, T_w_i, vel_w_i, bg, ba, true);
+
+  marg_order.abs_order_map[t_ns] = std::make_pair(0, POSE_VEL_BIAS_SIZE);
+  marg_order.total_size = POSE_VEL_BIAS_SIZE;
+  marg_order.items = 1;
+
+  initialize(bg, ba);
+}
+
+void KeypointVioEstimator::initialize(const Eigen::Vector3d& bg,
+                                      const Eigen::Vector3d& ba) {
+  auto proc_func = [&, bg, ba] {
     OpticalFlowResult::Ptr prev_frame, curr_frame;
     IntegratedImuMeasurement::Ptr meas;
 
+    const Eigen::Vector3d accel_cov =
+        calib.dicrete_time_accel_noise_std().array().square();
+    const Eigen::Vector3d gyro_cov =
+        calib.dicrete_time_gyro_noise_std().array().square();
+
     ImuData::Ptr data;
     imu_data_queue.pop(data);
+    data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
+    data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
 
     while (true) {
       vision_data_queue.pop(curr_frame);
 
+      if (config.vio_enforce_realtime) {
+        // drop current frame if another frame is already in the queue.
+        while (!vision_data_queue.empty()) vision_data_queue.pop(curr_frame);
+      }
+
       if (!curr_frame.get()) {
         break;
+      }
+
+      // Correct camera time offset
+      // curr_frame->t_ns += calib.cam_time_offset_ns;
+
+      if (!initialized) {
+        while (data->t_ns < curr_frame->t_ns) {
+          imu_data_queue.pop(data);
+          if (!data.get()) break;
+          data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
+          data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
+          // std::cout << "Skipping IMU data.." << std::endl;
+        }
+
+        Eigen::Vector3d vel_w_i_init;
+        vel_w_i_init.setZero();
+
+        T_w_i_init.setQuaternion(Eigen::Quaterniond::FromTwoVectors(
+            data->accel, Eigen::Vector3d::UnitZ()));
+
+        last_state_t_ns = curr_frame->t_ns;
+        imu_meas[last_state_t_ns] =
+            IntegratedImuMeasurement(last_state_t_ns, bg, ba);
+        frame_states[last_state_t_ns] = PoseVelBiasStateWithLin(
+            last_state_t_ns, T_w_i_init, vel_w_i_init, bg, ba, true);
+
+        marg_order.abs_order_map[last_state_t_ns] =
+            std::make_pair(0, POSE_VEL_BIAS_SIZE);
+        marg_order.total_size = POSE_VEL_BIAS_SIZE;
+        marg_order.items = 1;
+
+        std::cout << "Setting up filter: t_ns " << last_state_t_ns << std::endl;
+        std::cout << "T_w_i\n" << T_w_i_init.matrix() << std::endl;
+        std::cout << "vel_w_i " << vel_w_i_init.transpose() << std::endl;
+
+        initialized = true;
       }
 
       if (prev_frame) {
@@ -119,20 +181,24 @@ KeypointVioEstimator::KeypointVioEstimator(
 
         while (data->t_ns <= prev_frame->t_ns) {
           imu_data_queue.pop(data);
-
           if (!data.get()) break;
+          data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
+          data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
         }
 
         while (data->t_ns <= curr_frame->t_ns) {
-          meas->integrate(*data);
+          meas->integrate(*data, accel_cov, gyro_cov);
           imu_data_queue.pop(data);
           if (!data.get()) break;
+          data->accel = calib.calib_accel_bias.getCalibrated(data->accel);
+          data->gyro = calib.calib_gyro_bias.getCalibrated(data->gyro);
         }
 
         if (meas->get_start_t_ns() + meas->get_dt_ns() < curr_frame->t_ns) {
+          if (!data.get()) break;
           int64_t tmp = data->t_ns;
           data->t_ns = curr_frame->t_ns;
-          meas->integrate(*data);
+          meas->integrate(*data, accel_cov, gyro_cov);
           data->t_ns = tmp;
         }
       }
@@ -196,20 +262,20 @@ bool KeypointVioEstimator::measure(const OpticalFlowResult::Ptr& opt_flow_meas,
     for (const auto& kv_obs : opt_flow_meas->observations[i]) {
       int kpt_id = kv_obs.first;
 
-      auto it = kpts.find(kpt_id);
-      if (it != kpts.end()) {
-        const TimeCamId& tcid_host = it->second.kf_id;
+      if (lmdb.landmarkExists(kpt_id)) {
+        const TimeCamId& tcid_host = lmdb.getLandmark(kpt_id).kf_id;
 
         KeypointObservation kobs;
         kobs.kpt_id = kpt_id;
         kobs.pos = kv_obs.second.translation().cast<double>();
 
-        obs[tcid_host][tcid_target].push_back(kobs);
+        lmdb.addObservation(tcid_target, kobs);
+        // obs[tcid_host][tcid_target].push_back(kobs);
 
-        if (num_points_connected.count(tcid_host.first) == 0) {
-          num_points_connected[tcid_host.first] = 0;
+        if (num_points_connected.count(tcid_host.frame_id) == 0) {
+          num_points_connected[tcid_host.frame_id] = 0;
         }
-        num_points_connected[tcid_host.first]++;
+        num_points_connected[tcid_host.frame_id]++;
 
         if (i == 0) connected0++;
       } else {
@@ -261,6 +327,8 @@ bool KeypointVioEstimator::measure(const OpticalFlowResult::Ptr& opt_flow_meas,
 
       // triangulate
       bool valid_kp = false;
+      const double min_triang_distance2 =
+          config.vio_min_triangulation_dist * config.vio_min_triangulation_dist;
       for (const auto& kv_obs : kp_obs) {
         if (valid_kp) break;
         TimeCamId tcido = kv_obs.first;
@@ -269,46 +337,44 @@ bool KeypointVioEstimator::measure(const OpticalFlowResult::Ptr& opt_flow_meas,
                                        .at(lm_id)
                                        .translation()
                                        .cast<double>();
-        const Eigen::Vector2d p1 = prev_opt_flow_res[tcido.first]
-                                       ->observations[tcido.second]
+        const Eigen::Vector2d p1 = prev_opt_flow_res[tcido.frame_id]
+                                       ->observations[tcido.cam_id]
                                        .at(lm_id)
                                        .translation()
                                        .cast<double>();
 
         Eigen::Vector4d p0_3d, p1_3d;
         bool valid1 = calib.intrinsics[0].unproject(p0, p0_3d);
-        bool valid2 = calib.intrinsics[tcido.second].unproject(p1, p1_3d);
+        bool valid2 = calib.intrinsics[tcido.cam_id].unproject(p1, p1_3d);
         if (!valid1 || !valid2) continue;
 
         Sophus::SE3d T_i0_i1 =
-            getPoseStateWithLin(tcidl.first).getPose().inverse() *
-            getPoseStateWithLin(tcido.first).getPose();
+            getPoseStateWithLin(tcidl.frame_id).getPose().inverse() *
+            getPoseStateWithLin(tcido.frame_id).getPose();
         Sophus::SE3d T_0_1 =
-            calib.T_i_c[0].inverse() * T_i0_i1 * calib.T_i_c[tcido.second];
+            calib.T_i_c[0].inverse() * T_i0_i1 * calib.T_i_c[tcido.cam_id];
 
-        if (T_0_1.translation().squaredNorm() < 0.03 * 0.03) continue;
+        if (T_0_1.translation().squaredNorm() < min_triang_distance2) continue;
 
         Eigen::Vector4d p0_triangulated =
             triangulate(p0_3d.head<3>(), p1_3d.head<3>(), T_0_1);
 
-        if (p0_triangulated[2] > 0) {
+        if (p0_triangulated.array().isFinite().all() &&
+            p0_triangulated[3] > 0 && p0_triangulated[3] < 3.0) {
           KeypointPosition kpt_pos;
           kpt_pos.kf_id = tcidl;
           kpt_pos.dir = StereographicParam<double>::project(p0_triangulated);
-          kpt_pos.id = 1.0 / p0_triangulated.norm();
+          kpt_pos.id = p0_triangulated[3];
+          lmdb.addLandmark(lm_id, kpt_pos);
 
-          if (kpt_pos.id > 0 && kpt_pos.id < 10) {
-            kpts[lm_id] = kpt_pos;
-
-            num_points_added++;
-            valid_kp = true;
-          }
+          num_points_added++;
+          valid_kp = true;
         }
       }
 
       if (valid_kp) {
         for (const auto& kv_obs : kp_obs) {
-          obs[tcidl][kv_obs.first].push_back(kv_obs.second);
+          lmdb.addObservation(kv_obs.first, kv_obs.second);
         }
       }
     }
@@ -346,6 +412,8 @@ bool KeypointVioEstimator::measure(const OpticalFlowResult::Ptr& opt_flow_meas,
 
     data->projections.resize(opt_flow_meas->observations.size());
     computeProjections(data->projections);
+
+    data->opt_flow_res = prev_opt_flow_res[last_state_t_ns];
 
     out_vis_queue->push(data);
   }
@@ -628,17 +696,16 @@ void KeypointVioEstimator::marginalize(
                  Eigen::map<TimeCamId, Eigen::vector<KeypointObservation>>>
           obs_to_lin;
 
-      for (auto it = obs.cbegin(); it != obs.cend();) {
-        if (kfs_to_marg.count(it->first.first) > 0) {
+      for (auto it = lmdb.getObservations().cbegin();
+           it != lmdb.getObservations().cend();) {
+        if (kfs_to_marg.count(it->first.frame_id) > 0) {
           for (auto it2 = it->second.cbegin(); it2 != it->second.cend();
                ++it2) {
-            if (it2->first.first <= last_state_to_marg)
+            if (it2->first.frame_id <= last_state_to_marg)
               obs_to_lin[it->first].emplace(*it2);
           }
-          it = obs.erase(it);
-        } else {
-          ++it;
         }
+        ++it;
       }
 
       double rld_error;
@@ -654,15 +721,6 @@ void KeypointVioEstimator::marginalize(
         linearizeRel(rld, rel_H, rel_b);
 
         linearizeAbs(rel_H, rel_b, rld, aom, accum);
-      }
-
-      // remove points
-      for (auto it = kpts.cbegin(); it != kpts.cend();) {
-        if (kfs_to_marg.count(it->second.kf_id.first) > 0) {
-          it = kpts.erase(it);
-        } else {
-          ++it;
-        }
       }
     }
 
@@ -763,16 +821,7 @@ void KeypointVioEstimator::marginalize(
       prev_opt_flow_res.erase(id);
     }
 
-    for (auto it = obs.begin(); it != obs.end(); ++it) {
-      for (auto it2 = it->second.cbegin(); it2 != it->second.cend();) {
-        if (poses_to_marg.count(it2->first.first) > 0 ||
-            states_to_marg_all.count(it2->first.first) > 0) {
-          it2 = it->second.erase(it2);
-        } else {
-          ++it2;
-        }
-      }
-    }
+    lmdb.removeKeyframes(kfs_to_marg, poses_to_marg, states_to_marg_all);
 
     AbsOrderMap marg_order_new;
 
@@ -879,7 +928,7 @@ void KeypointVioEstimator::optimize() {
 
       double rld_error;
       Eigen::vector<RelLinData> rld_vec;
-      linearizeHelper(rld_vec, obs, rld_error);
+      linearizeHelper(rld_vec, lmdb.getObservations(), rld_error);
 
       BundleAdjustmentBase::LinearizeAbsReduce<DenseAccumulator<double>> lopt(
           aom);
@@ -900,8 +949,13 @@ void KeypointVioEstimator::optimize() {
       double error_total =
           rld_error + imu_error + marg_prior_error + ba_error + bg_error;
 
-      lopt.accum.getH().diagonal() *= 1.0001;
-      const Eigen::VectorXd inc = lopt.accum.solve();
+      lopt.accum.setup_solver();
+      Eigen::VectorXd Hdiag = lopt.accum.Hdiagonal();
+      Hdiag *= 1e-12;
+      for (int i = 0; i < Hdiag.size(); i++)
+        Hdiag[i] = std::max(Hdiag[i], 1e-12);
+
+      const Eigen::VectorXd inc = lopt.accum.solve(&Hdiag);
 
       // apply increment to poses
       for (auto& kv : frame_poses) {
@@ -971,6 +1025,10 @@ void KeypointVioEstimator::optimize() {
         }
       }
 
+      if (iter == config.vio_filter_iteration) {
+        filterOutliers(config.vio_outlier_threshold, 4);
+      }
+
       if (inc.array().abs().maxCoeff() < 1e-4) break;
 
       // std::cerr << "LT\n" << LT << std::endl;
@@ -986,21 +1044,21 @@ void KeypointVioEstimator::optimize() {
 
 void KeypointVioEstimator::computeProjections(
     std::vector<Eigen::vector<Eigen::Vector4d>>& data) const {
-  for (const auto& kv : obs) {
+  for (const auto& kv : lmdb.getObservations()) {
     const TimeCamId& tcid_h = kv.first;
 
     for (const auto& obs_kv : kv.second) {
       const TimeCamId& tcid_t = obs_kv.first;
 
-      if (tcid_t.first != last_state_t_ns) continue;
+      if (tcid_t.frame_id != last_state_t_ns) continue;
 
       if (tcid_h != tcid_t) {
-        PoseStateWithLin state_h = getPoseStateWithLin(tcid_h.first);
-        PoseStateWithLin state_t = getPoseStateWithLin(tcid_t.first);
+        PoseStateWithLin state_h = getPoseStateWithLin(tcid_h.frame_id);
+        PoseStateWithLin state_t = getPoseStateWithLin(tcid_t.frame_id);
 
         Sophus::SE3d T_t_h_sophus =
-            computeRelPose(state_h.getPose(), calib.T_i_c[tcid_h.second],
-                           state_t.getPose(), calib.T_i_c[tcid_t.second]);
+            computeRelPose(state_h.getPose(), calib.T_i_c[tcid_h.cam_id],
+                           state_t.getPose(), calib.T_i_c[tcid_t.cam_id]);
 
         Eigen::Matrix4d T_t_h = T_t_h_sophus.matrix();
 
@@ -1010,7 +1068,8 @@ void KeypointVioEstimator::computeProjections(
             [&](const auto& cam) {
               for (size_t i = 0; i < obs_kv.second.size(); i++) {
                 const KeypointObservation& kpt_obs = obs_kv.second[i];
-                const KeypointPosition& kpt_pos = kpts.at(kpt_obs.kpt_id);
+                const KeypointPosition& kpt_pos =
+                    lmdb.getLandmark(kpt_obs.kpt_id);
 
                 Eigen::Vector2d res;
                 Eigen::Vector4d proj;
@@ -1019,10 +1078,10 @@ void KeypointVioEstimator::computeProjections(
                                nullptr, &proj);
 
                 proj[3] = kpt_obs.kpt_id;
-                data[tcid_t.second].emplace_back(proj);
+                data[tcid_t.cam_id].emplace_back(proj);
               }
             },
-            calib.intrinsics[tcid_t.second].variant);
+            calib.intrinsics[tcid_t.cam_id].variant);
 
       } else {
         // target and host are the same
@@ -1033,7 +1092,8 @@ void KeypointVioEstimator::computeProjections(
             [&](const auto& cam) {
               for (size_t i = 0; i < obs_kv.second.size(); i++) {
                 const KeypointObservation& kpt_obs = obs_kv.second[i];
-                const KeypointPosition& kpt_pos = kpts.at(kpt_obs.kpt_id);
+                const KeypointPosition& kpt_pos =
+                    lmdb.getLandmark(kpt_obs.kpt_id);
 
                 Eigen::Vector2d res;
                 Eigen::Vector4d proj;
@@ -1042,10 +1102,10 @@ void KeypointVioEstimator::computeProjections(
                                cam, res, nullptr, nullptr, &proj);
 
                 proj[3] = kpt_obs.kpt_id;
-                data[tcid_t.second].emplace_back(proj);
+                data[tcid_t.cam_id].emplace_back(proj);
               }
             },
-            calib.intrinsics[tcid_t.second].variant);
+            calib.intrinsics[tcid_t.cam_id].variant);
       }
     }
   }

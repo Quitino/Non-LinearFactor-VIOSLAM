@@ -50,11 +50,13 @@ namespace basalt {
 
 CamCalib::CamCalib(const std::string &dataset_path,
                    const std::string &dataset_type,
+                   const std::string &aprilgrid_path,
                    const std::string &cache_path,
                    const std::string &cache_dataset_name, int skip_images,
                    const std::vector<std::string> &cam_types, bool show_gui)
     : dataset_path(dataset_path),
       dataset_type(dataset_type),
+      april_grid(aprilgrid_path),
       cache_path(ensure_trailing_slash(cache_path)),
       cache_dataset_name(cache_dataset_name),
       skip_images(skip_images),
@@ -68,11 +70,18 @@ CamCalib::CamCalib(const std::string &dataset_path,
       show_vign("ui.show_vign", false, false, true),
       show_ids("ui.show_ids", false, false, true),
       huber_thresh("ui.huber_thresh", 4.0, 0.1, 10.0),
-      opt_intr("ui.opt_intr", true, false, true) {
+      opt_intr("ui.opt_intr", true, false, true),
+      opt_until_convg("ui.opt_until_converge", false, false, true),
+      stop_thresh("ui.stop_thresh", 1e-8, 1e-10, 0.01, true) {
   if (show_gui) initGui();
 
   if (!fs::exists(cache_path)) {
     fs::create_directory(cache_path);
+  }
+
+  pangolin::ColourWheel cw;
+  for (int i = 0; i < 20; i++) {
+    cam_colors.emplace_back(cw.GetUniqueColour());
   }
 }
 
@@ -85,20 +94,34 @@ CamCalib::~CamCalib() {
 void CamCalib::initGui() {
   pangolin::CreateWindowAndBind("Main", 1600, 1000);
 
+  pangolin::CreatePanel("ui").SetBounds(0.0, 1.0, 0.0,
+                                        pangolin::Attach::Pix(UI_WIDTH));
+
   img_view_display =
       &pangolin::CreateDisplay()
            .SetBounds(0.5, 1.0, pangolin::Attach::Pix(UI_WIDTH), 1.0)
            .SetLayout(pangolin::LayoutEqual);
 
   pangolin::View &vign_plot_display =
-      pangolin::CreateDisplay().SetBounds(0.0, 0.5, 0.7, 1.0);
-
-  pangolin::CreatePanel("ui").SetBounds(0.0, 1.0, 0.0,
-                                        pangolin::Attach::Pix(UI_WIDTH));
+      pangolin::CreateDisplay().SetBounds(0.0, 0.5, 0.72, 1.0);
 
   vign_plotter.reset(new pangolin::Plotter(&vign_data_log, 0.0, 1000.0, 0.0,
                                            1.0, 0.01f, 0.01f));
   vign_plot_display.AddDisplay(*vign_plotter);
+
+  pangolin::View &polar_error_display = pangolin::CreateDisplay().SetBounds(
+      0.0, 0.5, pangolin::Attach::Pix(UI_WIDTH), 0.43);
+
+  polar_plotter.reset(
+      new pangolin::Plotter(nullptr, 0.0, 120.0, 0.0, 1.0, 0.01f, 0.01f));
+  polar_error_display.AddDisplay(*polar_plotter);
+
+  pangolin::View &azimuthal_plot_display =
+      pangolin::CreateDisplay().SetBounds(0.0, 0.5, 0.45, 0.7);
+
+  azimuth_plotter.reset(
+      new pangolin::Plotter(nullptr, -180.0, 180.0, 0.0, 1.0, 0.01f, 0.01f));
+  azimuthal_plot_display.AddDisplay(*azimuth_plotter);
 
   pangolin::Var<std::function<void(void)>> load_dataset(
       "ui.load_dataset", std::bind(&CamCalib::loadDataset, this));
@@ -150,19 +173,24 @@ void CamCalib::computeVign() {
 
       if (it != reprojected_vignette.end() && img_vec[j].img.get()) {
         Eigen::vector<Eigen::Vector3d> rv;
-        rv.resize(it->second.size());
+        rv.resize(it->second.corners_proj.size());
 
-        for (size_t k = 0; k < it->second.size(); k++) {
-          Eigen::Vector2d pos = it->second[k];
+        for (size_t k = 0; k < it->second.corners_proj.size(); k++) {
+          Eigen::Vector2d pos = it->second.corners_proj[k];
 
           rv[k].head<2>() = pos;
 
-          if (img_vec[j].img->InBounds(pos[0], pos[1], 1)) {
+          if (img_vec[j].img->InBounds(pos[0], pos[1], 1) &&
+              it->second.corners_proj_success[k]) {
             double val = img_vec[j].img->interp(pos);
             val /= std::numeric_limits<uint16_t>::max();
+
+            if (img_vec[j].exposure > 0) {
+              val *= 0.001 / img_vec[j].exposure;  // bring to common exposure
+            }
+
             rv[k][2] = val;
           } else {
-            // invalid projection
             rv[k][2] = -1;
           }
         }
@@ -172,12 +200,17 @@ void CamCalib::computeVign() {
     }
   }
 
-  VignetteEstimator ve(vio_dataset, optical_centers, reprojected_vignette2,
+  VignetteEstimator ve(vio_dataset, optical_centers,
+                       calib_opt->calib->resolution, reprojected_vignette2,
                        april_grid);
 
   ve.optimize();
   ve.compute_error(&reprojected_vignette_error);
-  ve.compute_data_log(vign_data_log);
+
+  std::vector<std::vector<float>> vign_data;
+  ve.compute_data_log(vign_data);
+  vign_data_log.Clear();
+  for (const auto &v : vign_data) vign_data_log.Log(v);
 
   {
     vign_plotter->ClearSeries();
@@ -185,8 +218,7 @@ void CamCalib::computeVign() {
 
     for (size_t i = 0; i < calib_opt->calib->intrinsics.size(); i++) {
       vign_plotter->AddSeries("$i", "$" + std::to_string(2 * i),
-                              pangolin::DrawingModeLine,
-                              pangolin::Colour::Unspecified(),
+                              pangolin::DrawingModeLine, cam_colors[i],
                               "vignette camera " + std::to_string(i));
     }
 
@@ -240,6 +272,11 @@ void CamCalib::renderingLoop() {
       }
     }
 
+    if (opt_until_convg) {
+      bool converged = optimizeWithParam(true);
+      if (converged) opt_until_convg = false;
+    }
+
     pangolin::FinishFrame();
   }
 }
@@ -250,13 +287,32 @@ void CamCalib::computeProjections() {
 
   if (!calib_opt.get() || !vio_dataset.get()) return;
 
+  constexpr int ANGLE_BIN_SIZE = 2;
+  std::vector<Eigen::Matrix<double, 180 / ANGLE_BIN_SIZE, 1>> polar_sum(
+      calib_opt->calib->intrinsics.size());
+  std::vector<Eigen::Matrix<int, 180 / ANGLE_BIN_SIZE, 1>> polar_num(
+      calib_opt->calib->intrinsics.size());
+
+  std::vector<Eigen::Matrix<double, 360 / ANGLE_BIN_SIZE, 1>> azimuth_sum(
+      calib_opt->calib->intrinsics.size());
+  std::vector<Eigen::Matrix<int, 360 / ANGLE_BIN_SIZE, 1>> azimuth_num(
+      calib_opt->calib->intrinsics.size());
+
+  for (size_t i = 0; i < calib_opt->calib->intrinsics.size(); i++) {
+    polar_sum[i].setZero();
+    polar_num[i].setZero();
+    azimuth_sum[i].setZero();
+    azimuth_num[i].setZero();
+  }
+
   for (size_t j = 0; j < vio_dataset->get_image_timestamps().size(); ++j) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[j];
 
     for (size_t i = 0; i < calib_opt->calib->intrinsics.size(); i++) {
-      TimeCamId tcid = std::make_pair(timestamp_ns, i);
+      TimeCamId tcid(timestamp_ns, i);
 
-      Eigen::vector<Eigen::Vector2d> rc, rv;
+      ProjectedCornerData rc, rv;
+      Eigen::vector<Eigen::Vector2d> polar_azimuthal_angle;
 
       Sophus::SE3d T_c_w_ =
           (calib_opt->getT_w_i(timestamp_ns) * calib_opt->calib->T_i_c[i])
@@ -264,20 +320,87 @@ void CamCalib::computeProjections() {
 
       Eigen::Matrix4d T_c_w = T_c_w_.matrix();
 
-      rc.resize(april_grid.aprilgrid_corner_pos_3d.size());
-      rv.resize(april_grid.aprilgrid_vignette_pos_3d.size());
-
-      std::vector<bool> rc_success, rv_success;
+      calib_opt->calib->intrinsics[i].project(
+          april_grid.aprilgrid_corner_pos_3d, T_c_w, rc.corners_proj,
+          rc.corners_proj_success, polar_azimuthal_angle);
 
       calib_opt->calib->intrinsics[i].project(
-          april_grid.aprilgrid_corner_pos_3d, T_c_w, rc, rc_success);
-
-      calib_opt->calib->intrinsics[i].project(
-          april_grid.aprilgrid_vignette_pos_3d, T_c_w, rv, rv_success);
+          april_grid.aprilgrid_vignette_pos_3d, T_c_w, rv.corners_proj,
+          rv.corners_proj_success);
 
       reprojected_corners.emplace(tcid, rc);
       reprojected_vignette.emplace(tcid, rv);
+
+      // Compute reprojection histogrames over polar and azimuth angle
+      auto it = calib_corners.find(tcid);
+      if (it != calib_corners.end()) {
+        for (size_t k = 0; k < it->second.corners.size(); k++) {
+          size_t id = it->second.corner_ids[k];
+
+          if (rc.corners_proj_success[id]) {
+            double error = (it->second.corners[k] - rc.corners_proj[id]).norm();
+
+            size_t polar_bin =
+                180 * polar_azimuthal_angle[id][0] / (M_PI * ANGLE_BIN_SIZE);
+
+            polar_sum[tcid.cam_id][polar_bin] += error;
+            polar_num[tcid.cam_id][polar_bin] += 1;
+
+            size_t azimuth_bin =
+                180 / ANGLE_BIN_SIZE + (180.0 * polar_azimuthal_angle[id][1]) /
+                                           (M_PI * ANGLE_BIN_SIZE);
+
+            azimuth_sum[tcid.cam_id][azimuth_bin] += error;
+            azimuth_num[tcid.cam_id][azimuth_bin] += 1;
+          }
+        }
+      }
     }
+  }
+
+  while (polar_data_log.size() < calib_opt->calib->intrinsics.size()) {
+    polar_data_log.emplace_back(new pangolin::DataLog);
+  }
+
+  while (azimuth_data_log.size() < calib_opt->calib->intrinsics.size()) {
+    azimuth_data_log.emplace_back(new pangolin::DataLog);
+  }
+
+  constexpr int MIN_POINTS_HIST = 3;
+  polar_plotter->ClearSeries();
+  azimuth_plotter->ClearSeries();
+
+  for (size_t c = 0; c < calib_opt->calib->intrinsics.size(); c++) {
+    polar_data_log[c]->Clear();
+    azimuth_data_log[c]->Clear();
+
+    for (int i = 0; i < polar_sum[c].rows(); i++) {
+      if (polar_num[c][i] > MIN_POINTS_HIST) {
+        double x_coord = ANGLE_BIN_SIZE * i + ANGLE_BIN_SIZE / 2.0;
+        double mean_reproj = polar_sum[c][i] / polar_num[c][i];
+
+        polar_data_log[c]->Log(x_coord, mean_reproj);
+      }
+    }
+
+    polar_plotter->AddSeries(
+        "$0", "$1", pangolin::DrawingModeLine, cam_colors[c],
+        "mean error(pix) vs polar angle(deg) for cam" + std::to_string(c),
+        polar_data_log[c].get());
+
+    for (int i = 0; i < azimuth_sum[c].rows(); i++) {
+      if (azimuth_num[c][i] > MIN_POINTS_HIST) {
+        double x_coord = ANGLE_BIN_SIZE * i + ANGLE_BIN_SIZE / 2.0 - 180.0;
+        double mean_reproj = azimuth_sum[c][i] / azimuth_num[c][i];
+
+        azimuth_data_log[c]->Log(x_coord, mean_reproj);
+      }
+    }
+
+    azimuth_plotter->AddSeries(
+        "$0", "$1", pangolin::DrawingModeLine, cam_colors[c],
+        "mean error(pix) vs azimuth angle(deg) for cam" + std::to_string(c),
+        azimuth_data_log[c].get());
   }
 }
 
@@ -331,7 +454,7 @@ void CamCalib::initCamIntrinsics() {
       const std::vector<basalt::ImageData> &img_vec =
           vio_dataset->get_image_data(timestamp_ns);
 
-      TimeCamId tcid = std::make_pair(timestamp_ns, j);
+      TimeCamId tcid(timestamp_ns, j);
 
       if (calib_corners.find(tcid) != calib_corners.end()) {
         CalibCornerData cid = calib_corners.at(tcid);
@@ -353,8 +476,25 @@ void CamCalib::initCamIntrinsics() {
 
   // set resolution
   {
-    int64_t t_ns = vio_dataset->get_image_timestamps()[1];
-    const auto img_data = vio_dataset->get_image_data(t_ns);
+    size_t img_idx = 1;
+    int64_t t_ns = vio_dataset->get_image_timestamps()[img_idx];
+    auto img_data = vio_dataset->get_image_data(t_ns);
+
+    // Find the frame with all valid images
+    while (img_idx < vio_dataset->get_image_timestamps().size()) {
+      bool img_data_valid = true;
+      for (size_t i = 0; i < vio_dataset->get_num_cams(); i++) {
+        if (!img_data[i].img.get()) img_data_valid = false;
+      }
+
+      if (!img_data_valid) {
+        img_idx++;
+        int64_t t_ns_new = vio_dataset->get_image_timestamps()[img_idx];
+        img_data = vio_dataset->get_image_data(t_ns_new);
+      } else {
+        break;
+      }
+    }
 
     Eigen::vector<Eigen::Vector2i> res;
 
@@ -388,7 +528,7 @@ void CamCalib::initCamPoses() {
 
   std::cout << "Started initial camera pose computation " << std::endl;
 
-  CalibHelper::initCamPoses(calib_opt->calib, this->vio_dataset,
+  CalibHelper::initCamPoses(calib_opt->calib,
                             april_grid.aprilgrid_corner_pos_3d,
                             this->calib_corners, this->calib_init_poses);
 
@@ -420,7 +560,7 @@ void CamCalib::initCamExtrinsics() {
   for (size_t i = 0; i < vio_dataset->get_image_timestamps().size(); i++) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[i];
 
-    TimeCamId tcid0 = std::make_pair(timestamp_ns, 0);
+    TimeCamId tcid0(timestamp_ns, 0);
 
     if (calib_init_poses.find(tcid0) == calib_init_poses.end()) continue;
 
@@ -429,7 +569,7 @@ void CamCalib::initCamExtrinsics() {
     bool success = true;
 
     for (size_t j = 1; j < vio_dataset->get_num_cams(); j++) {
-      TimeCamId tcid = std::make_pair(timestamp_ns, j);
+      TimeCamId tcid(timestamp_ns, j);
 
       auto cd = calib_init_poses.find(tcid);
       if (cd != calib_init_poses.end() && cd->second.num_inliers > 0) {
@@ -468,12 +608,12 @@ void CamCalib::initOptimization() {
   std::set<uint64_t> invalid_timestamps;
   for (const auto &kv : calib_corners) {
     if (kv.second.corner_ids.size() < MIN_CORNERS)
-      invalid_timestamps.insert(kv.first.first);
+      invalid_timestamps.insert(kv.first.frame_id);
   }
 
   for (const auto &kv : calib_corners) {
-    if (invalid_timestamps.find(kv.first.first) == invalid_timestamps.end())
-      calib_opt->addAprilgridMeasurement(kv.first.first, kv.first.second,
+    if (invalid_timestamps.find(kv.first.frame_id) == invalid_timestamps.end())
+      calib_opt->addAprilgridMeasurement(kv.first.frame_id, kv.first.cam_id,
                                          kv.second.corners,
                                          kv.second.corner_ids);
   }
@@ -481,11 +621,17 @@ void CamCalib::initOptimization() {
   for (size_t j = 0; j < vio_dataset->get_image_timestamps().size(); ++j) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[j];
 
-    TimeCamId tcid = std::make_pair(timestamp_ns, 0);
-    const CalibInitPoseData &cp = calib_init_poses.at(tcid);
+    for (size_t cam_id = 0; cam_id < calib_opt->calib->T_i_c.size(); cam_id++) {
+      TimeCamId tcid(timestamp_ns, cam_id);
+      const auto cp_it = calib_init_poses.find(tcid);
 
-    calib_opt->addPoseMeasurement(
-        timestamp_ns, cp.T_a_c * calib_opt->calib->T_i_c[0].inverse());
+      if (cp_it != calib_init_poses.end()) {
+        calib_opt->addPoseMeasurement(
+            timestamp_ns,
+            cp_it->second.T_a_c * calib_opt->calib->T_i_c[cam_id].inverse());
+        break;
+      }
+    }
   }
 
   calib_opt->init();
@@ -572,21 +718,23 @@ void CamCalib::loadDataset() {
 
 void CamCalib::optimize() { optimizeWithParam(true); }
 
-void CamCalib::optimizeWithParam(bool print_info,
+bool CamCalib::optimizeWithParam(bool print_info,
                                  std::map<std::string, double> *stats) {
   if (calib_init_poses.empty()) {
     std::cerr << "No initial camera poses. Press init_cam_poses initialize "
                  "camera poses "
               << std::endl;
-    return;
+    return true;
   }
 
   if (!calib_opt.get() || !calib_opt->calibInitialized()) {
     std::cerr << "No initial intrinsics. Press init_intrinsics initialize "
                  "intrinsics"
               << std::endl;
-    return;
+    return true;
   }
+
+  bool converged = true;
 
   if (calib_opt) {
     // calib_opt->compute_projections();
@@ -596,8 +744,8 @@ void CamCalib::optimizeWithParam(bool print_info,
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    calib_opt->optimize(opt_intr, huber_thresh, error, num_points,
-                        reprojection_error);
+    converged = calib_opt->optimize(opt_intr, huber_thresh, stop_thresh, error,
+                                    num_points, reprojection_error);
 
     auto finish = std::chrono::high_resolution_clock::now();
 
@@ -633,6 +781,8 @@ void CamCalib::optimizeWithParam(bool print_info,
                        .count()
                 << "ms." << std::endl;
 
+      if (converged) std::cout << "Optimization Converged !!" << std::endl;
+
       std::cout << "==================================" << std::endl;
     }
 
@@ -640,11 +790,13 @@ void CamCalib::optimizeWithParam(bool print_info,
       computeProjections();
     }
   }
+
+  return converged;
 }
 
 void CamCalib::saveCalib() {
   if (calib_opt) {
-    calib_opt->saveCalib(cache_path, vio_dataset->get_mocap_to_imu_offset_ns());
+    calib_opt->saveCalib(cache_path);
 
     std::cout << "Saved calibration in " << cache_path << "calibration.json"
               << std::endl;
@@ -658,7 +810,7 @@ void CamCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
 
   if (vio_dataset && frame_id < vio_dataset->get_image_timestamps().size()) {
     int64_t timestamp_ns = vio_dataset->get_image_timestamps()[frame_id];
-    TimeCamId tcid = std::make_pair(timestamp_ns, cam_id);
+    TimeCamId tcid(timestamp_ns, cam_id);
 
     if (show_corners) {
       glLineWidth(1.0);
@@ -742,11 +894,14 @@ void CamCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
       if (reprojected_corners.find(tcid) != reprojected_corners.end()) {
-        if (calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
+        if (calib_corners.count(tcid) > 0 &&
+            calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
           const auto &rc = reprojected_corners.at(tcid);
 
-          for (size_t i = 0; i < rc.size(); i++) {
-            Eigen::Vector2d c = rc[i];
+          for (size_t i = 0; i < rc.corners_proj.size(); i++) {
+            if (!rc.corners_proj_success[i]) continue;
+
+            Eigen::Vector2d c = rc.corners_proj[i];
             pangolin::glDrawCirclePerimeter(c[0], c[1], 3.0);
 
             if (show_ids) pangolin::GlFont::I().Text("%d", i).Draw(c[0], c[1]);
@@ -764,15 +919,18 @@ void CamCalib::drawImageOverlay(pangolin::View &v, size_t cam_id) {
       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
       if (reprojected_vignette.find(tcid) != reprojected_vignette.end()) {
-        if (calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
+        if (calib_corners.count(tcid) > 0 &&
+            calib_corners.at(tcid).corner_ids.size() >= MIN_CORNERS) {
           const auto &rc = reprojected_vignette.at(tcid);
 
           bool has_errors = false;
           auto it = reprojected_vignette_error.find(tcid);
           if (it != reprojected_vignette_error.end()) has_errors = true;
 
-          for (size_t i = 0; i < rc.size(); i++) {
-            Eigen::Vector2d c = rc[i].head<2>();
+          for (size_t i = 0; i < rc.corners_proj.size(); i++) {
+            if (!rc.corners_proj_success[i]) continue;
+
+            Eigen::Vector2d c = rc.corners_proj[i].head<2>();
             pangolin::glDrawCirclePerimeter(c[0], c[1], 3.0);
 
             if (show_ids) {

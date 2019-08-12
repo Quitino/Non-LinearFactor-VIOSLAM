@@ -49,16 +49,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
 
-#include <mutex>
-
-#include <DBoW3.h>
-
 namespace basalt {
+
+template <size_t N>
+class HashBow;
 
 class NfrMapper : public BundleAdjustmentBase {
  public:
   using Ptr = std::shared_ptr<NfrMapper>;
-  using TimeCamId = std::pair<int64_t, std::size_t>;
   using Matches = tbb::concurrent_unordered_map<
       std::pair<TimeCamId, TimeCamId>, MatchData,
       tbb::tbb_hash<std::pair<TimeCamId, TimeCamId>>,
@@ -164,14 +162,13 @@ class NfrMapper : public BundleAdjustmentBase {
     const Eigen::map<int64_t, PoseStateWithLin>* frame_poses;
   };
 
-  NfrMapper(const basalt::Calibration<double>& calib, const VioConfig& config,
-            const std::string& vocabulary = "");
+  NfrMapper(const basalt::Calibration<double>& calib, const VioConfig& config);
 
   void addMargData(basalt::MargData::Ptr& data);
 
   void processMargData(basalt::MargData& m);
 
-  void extractNonlinearFactors(basalt::MargData& m);
+  bool extractNonlinearFactors(basalt::MargData& m);
 
   void optimize(int num_iterations = 10);
 
@@ -199,19 +196,13 @@ class NfrMapper : public BundleAdjustmentBase {
 
   std::unordered_map<int64_t, OpticalFlowInput::Ptr> img_data;
 
-  tbb::concurrent_unordered_map<
-      TimeCamId, std::pair<DBoW3::BowVector, DBoW3::FeatureVector>>
-      bow_data;
-
   Corners feature_corners;
 
   Matches feature_matches;
 
   FeatureTracks feature_tracks;
 
-  DBoW3::Database bow_database;
-
-  std::unordered_map<int, TimeCamId> bow_id_to_tcid;
+  std::shared_ptr<HashBow<256>> hash_bow_database;
 
   VioConfig config;
 };

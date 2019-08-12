@@ -71,6 +71,8 @@ bool next_step();
 bool prev_step();
 void draw_plots();
 void alignButton();
+void alignDeviceButton();
+void saveTrajectoryButton();
 
 // Pangolin variables
 constexpr int UI_WIDTH = 200;
@@ -91,6 +93,7 @@ pangolin::Var<bool> show_est_bg("ui.show_est_bg", false, false, true);
 pangolin::Var<bool> show_est_ba("ui.show_est_ba", false, false, true);
 
 pangolin::Var<bool> show_gt("ui.show_gt", true, false, true);
+pangolin::Var<bool> show_device_gt("ui.show_device_gt", true, false, true);
 
 Button next_step_btn("ui.next_step", &next_step);
 Button prev_step_btn("ui.prev_step", &prev_step);
@@ -98,7 +101,11 @@ Button prev_step_btn("ui.prev_step", &prev_step);
 pangolin::Var<bool> continue_btn("ui.continue", false, false, true);
 pangolin::Var<bool> continue_fast("ui.continue_fast", true, false, true);
 
-Button align_svd_btn("ui.align_svd", &alignButton);
+Button align_se3_btn("ui.align_se3", &alignButton);
+
+pangolin::Var<bool> euroc_fmt("ui.euroc_fmt", true, false, true);
+pangolin::Var<bool> tum_rgbd_fmt("ui.tum_rgbd_fmt", false, false, true);
+Button save_traj_btn("ui.save_traj", &saveTrajectoryButton);
 
 pangolin::Var<bool> follow("ui.follow", true, false, true);
 
@@ -110,6 +117,7 @@ tbb::concurrent_bounded_queue<basalt::PoseVelBiasState::Ptr> out_state_queue;
 
 std::vector<int64_t> vio_t_ns;
 Eigen::vector<Eigen::Vector3d> vio_t_w_i;
+Eigen::vector<Sophus::SE3d> vio_T_w_i;
 
 std::vector<int64_t> gt_t_ns;
 Eigen::vector<Eigen::Vector3d> gt_t_w_i;
@@ -165,12 +173,6 @@ void feed_imu() {
     data->accel = vio_dataset->get_accel_data()[i].data;
     data->gyro = vio_dataset->get_gyro_data()[i].data;
 
-    const double accel_noise_std = calib.dicreete_time_accel_noise_std();
-    const double gyro_noise_std = calib.dicreete_time_gyro_noise_std();
-
-    data->accel_cov.setConstant(accel_noise_std * accel_noise_std);
-    data->gyro_cov.setConstant(gyro_noise_std * gyro_noise_std);
-
     vio->imu_data_queue.push(data);
   }
   vio->imu_data_queue.push(nullptr);
@@ -179,6 +181,7 @@ void feed_imu() {
 int main(int argc, char** argv) {
   bool show_gui = true;
   bool print_queue = false;
+  bool terminate = false;
   std::string cam_calib_path;
   std::string dataset_path;
   std::string dataset_type;
@@ -221,6 +224,17 @@ int main(int argc, char** argv) {
 
   if (!config_path.empty()) {
     vio_config.load(config_path);
+
+    if (vio_config.vio_enforce_realtime) {
+      vio_config.vio_enforce_realtime = false;
+      std::cout
+          << "The option vio_config.vio_enforce_realtime was enabled, "
+             "but it should only be used with the live executables (supply "
+             "images at a constant framerate). This executable runs on the "
+             "datasets and processes images as fast as it can, so the option "
+             "will be disabled. "
+          << std::endl;
+    }
   }
 
   load_data(cam_calib_path);
@@ -248,33 +262,10 @@ int main(int argc, char** argv) {
   }
 
   const int64_t start_t_ns = vio_dataset->get_image_timestamps().front();
-  Sophus::SE3d T_w_i_init;
-  Eigen::Vector3d vel_w_i_init;
-
   {
-    int64_t t_init_ns = vio_dataset->get_image_timestamps()[0];
-
-    {
-      T_w_i_init.setQuaternion(Eigen::Quaterniond::FromTwoVectors(
-          vio_dataset->get_accel_data()[0].data, Eigen::Vector3d::UnitZ()));
-
-      std::cout << "T_w_i_init\n" << T_w_i_init.matrix() << std::endl;
-      std::cout
-          << "accel_w "
-          << (T_w_i_init * vio_dataset->get_accel_data()[0].data).transpose()
-          << std::endl;
-    }
-
-    vel_w_i_init.setZero();
-
-    std::cout << "Setting up filter: t_ns " << t_init_ns << std::endl;
-    std::cout << "T_w_i\n" << T_w_i_init.matrix() << std::endl;
-    std::cout << "vel_w_i " << vel_w_i_init.transpose() << std::endl;
-
     vio = basalt::VioEstimatorFactory::getVioEstimator(
-        vio_config, calib, t_init_ns, T_w_i_init, vel_w_i_init,
-        Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0.0001,
-        basalt::constants::g);
+        vio_config, calib, 0.0001, basalt::constants::g);
+    vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     opt_flow_ptr->output_queue = &vio->vision_data_queue;
     if (show_gui) vio->out_vis_queue = &out_vis_queue;
@@ -343,6 +334,7 @@ int main(int argc, char** argv) {
 
       vio_t_ns.emplace_back(data->t_ns);
       vio_t_w_i.emplace_back(T_w_i.translation());
+      vio_T_w_i.emplace_back(T_w_i);
 
       if (show_gui) {
         std::vector<float> vals;
@@ -364,16 +356,18 @@ int main(int argc, char** argv) {
 
   if (print_queue) {
     t5.reset(new std::thread([&]() {
-      while (true) {
+      while (!terminate) {
         std::cout << "opt_flow_ptr->input_queue "
                   << opt_flow_ptr->input_queue.size()
                   << " opt_flow_ptr->output_queue "
                   << opt_flow_ptr->output_queue->size() << " out_state_queue "
                   << out_state_queue.size() << std::endl;
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
       }
     }));
   }
+
+  auto time_start = std::chrono::high_resolution_clock::now();
 
   if (show_gui) {
     pangolin::CreateWindowAndBind("Main", 1800, 1000);
@@ -408,7 +402,7 @@ int main(int argc, char** argv) {
     }
 
     Eigen::Vector3d cam_p(-0.5, -3, -5);
-    cam_p = T_w_i_init.so3() * calib.T_i_c[0].so3() * cam_p;
+    cam_p = vio->getT_w_i_init().so3() * calib.T_i_c[0].so3() * cam_p;
 
     pangolin::OpenGlRenderState camera(
         pangolin::ProjectionMatrix(640, 480, 400, 400, 320, 240, 0.001, 10000),
@@ -470,6 +464,14 @@ int main(int argc, char** argv) {
         draw_plots();
       }
 
+      if (euroc_fmt.GuiChanged()) {
+        tum_rgbd_fmt = !euroc_fmt;
+      }
+
+      if (tum_rgbd_fmt.GuiChanged()) {
+        euroc_fmt = !tum_rgbd_fmt;
+      }
+
       pangolin::FinishFrame();
 
       if (continue_btn) {
@@ -493,16 +495,30 @@ int main(int argc, char** argv) {
     }
   }
 
+  terminate = true;
+
   t1.join();
   t2.join();
   if (t3.get()) t3->join();
   t4.join();
+  if (t5.get()) t5->join();
+
+  auto time_end = std::chrono::high_resolution_clock::now();
 
   if (!result_path.empty()) {
     double error = basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i);
 
+    auto exec_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        time_end - time_start);
+
     std::ofstream os(result_path);
-    os << error << std::endl;
+    {
+      cereal::JSONOutputArchive ar(os);
+      ar(cereal::make_nvp("rms_ate", error));
+      ar(cereal::make_nvp("num_frames",
+                          vio_dataset->get_image_timestamps().size()));
+      ar(cereal::make_nvp("exec_time_ns", exec_time_ns.count()));
+    }
     os.close();
   }
 
@@ -510,6 +526,8 @@ int main(int argc, char** argv) {
 }
 
 void draw_image_overlay(pangolin::View& v, size_t cam_id) {
+  UNUSED(v);
+
   //  size_t frame_id = show_frame;
   //  basalt::TimeCamId tcid =
   //      std::make_pair(vio_dataset->get_image_timestamps()[frame_id],
@@ -565,9 +583,11 @@ void draw_scene() {
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
   glColor3ubv(cam_color);
-  Eigen::vector<Eigen::Vector3d> sub_gt(vio_t_w_i.begin(),
-                                        vio_t_w_i.begin() + show_frame);
-  pangolin::glDrawLineStrip(sub_gt);
+  if (!vio_t_w_i.empty()) {
+    Eigen::vector<Eigen::Vector3d> sub_gt(vio_t_w_i.begin(),
+                                          vio_t_w_i.begin() + show_frame);
+    pangolin::glDrawLineStrip(sub_gt);
+  }
 
   glColor3ubv(gt_color);
   if (show_gt) pangolin::glDrawLineStrip(gt_t_w_i);
@@ -680,3 +700,47 @@ void draw_plots() {
 }
 
 void alignButton() { basalt::alignSVD(vio_t_ns, vio_t_w_i, gt_t_ns, gt_t_w_i); }
+
+void saveTrajectoryButton() {
+  if (tum_rgbd_fmt) {
+    std::ofstream os("trajectory.txt");
+
+    os << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+
+    for (size_t i = 0; i < vio_t_ns.size(); i++) {
+      const Sophus::SE3d& pose = vio_T_w_i[i];
+      os << std::scientific << std::setprecision(18) << vio_t_ns[i] * 1e-9
+         << " " << pose.translation().x() << " " << pose.translation().y()
+         << " " << pose.translation().z() << " " << pose.unit_quaternion().x()
+         << " " << pose.unit_quaternion().y() << " "
+         << pose.unit_quaternion().z() << " " << pose.unit_quaternion().w()
+         << std::endl;
+    }
+
+    os.close();
+
+    std::cout
+        << "Saved trajectory in TUM RGB-D Dataset format in trajectory.txt"
+        << std::endl;
+  } else {
+    std::ofstream os("trajectory.csv");
+
+    os << "#timestamp [ns],p_RS_R_x [m],p_RS_R_y [m],p_RS_R_z [m],q_RS_w "
+          "[],q_RS_x [],q_RS_y [],q_RS_z []"
+       << std::endl;
+
+    for (size_t i = 0; i < vio_t_ns.size(); i++) {
+      const Sophus::SE3d& pose = vio_T_w_i[i];
+      os << std::scientific << std::setprecision(18) << vio_t_ns[i] << ","
+         << pose.translation().x() << "," << pose.translation().y() << ","
+         << pose.translation().z() << "," << pose.unit_quaternion().w() << ","
+         << pose.unit_quaternion().x() << "," << pose.unit_quaternion().y()
+         << "," << pose.unit_quaternion().z() << std::endl;
+    }
+
+    os.close();
+
+    std::cout << "Saved trajectory in Euroc Dataset format in trajectory.csv"
+              << std::endl;
+  }
+}

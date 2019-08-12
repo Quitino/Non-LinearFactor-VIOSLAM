@@ -34,7 +34,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #pragma once
 
-#include <basalt/utils/imu_types.h>
+#include <basalt/vi_estimator/landmark_database.h>
 
 #include <tbb/blocked_range.h>
 
@@ -42,22 +42,6 @@ namespace basalt {
 
 class BundleAdjustmentBase {
  public:
-  // keypoint position defined relative to some frame
-  struct KeypointPosition {
-    TimeCamId kf_id;
-    Eigen::Vector2d dir;
-    double id;
-
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  };
-
-  struct KeypointObservation {
-    int kpt_id;
-    Eigen::Vector2d pos;
-
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  };
-
   struct RelLinDataBase {
     std::vector<std::pair<TimeCamId, TimeCamId>> order;
 
@@ -113,7 +97,10 @@ class BundleAdjustmentBase {
     double error;
   };
 
-  void computeError(double& error) const;
+  void computeError(double& error,
+                    std::map<int, std::vector<std::pair<TimeCamId, double>>>*
+                        outliers = nullptr,
+                    double outlier_threshold = 0) const;
 
   void linearizeHelper(
       Eigen::vector<RelLinData>& rld_vec,
@@ -124,6 +111,8 @@ class BundleAdjustmentBase {
 
   static void linearizeRel(const RelLinData& rld, Eigen::MatrixXd& H,
                            Eigen::VectorXd& b);
+
+  void filterOutliers(double outlier_threshold, int min_num_obs);
 
   template <class CamT>
   static bool linearizePoint(
@@ -148,6 +137,7 @@ class BundleAdjustmentBase {
 
     Eigen::Matrix<double, 2, 4> Jp;
     bool valid = cam.project(p_t_3d, res, &Jp);
+    valid &= res.array().isFinite().all();
 
     if (!valid) {
       //      std::cerr << " Invalid projection! kpt_pos.dir "
@@ -174,6 +164,7 @@ class BundleAdjustmentBase {
 
     if (d_res_d_p) {
       Eigen::Matrix<double, 4, 3> Jpp;
+      Jpp.setZero();
       Jpp.block<3, 2>(0, 0) = T_t_h.topLeftCorner<3, 4>() * Jup;
       Jpp.col(2) = T_t_h.col(3);
 
@@ -196,6 +187,7 @@ class BundleAdjustmentBase {
 
     Eigen::Matrix<double, 2, 4> Jp;
     bool valid = cam.project(p_h_3d, res, &Jp);
+    valid &= res.array().isFinite().all();
 
     if (!valid) {
       //      std::cerr << " Invalid projection! kpt_pos.dir "
@@ -215,6 +207,7 @@ class BundleAdjustmentBase {
 
     if (d_res_d_p) {
       Eigen::Matrix<double, 4, 3> Jpp;
+      Jpp.setZero();
       Jpp.block<4, 2>(0, 0) = Jup;
       Jpp.col(2).setZero();
 
@@ -244,9 +237,38 @@ class BundleAdjustmentBase {
                                 Eigen::MatrixXd& marg_H,
                                 Eigen::VectorXd& marg_b);
 
-  static Eigen::Vector4d triangulate(const Eigen::Vector3d& p0_3d,
-                                     const Eigen::Vector3d& p1_3d,
-                                     const Sophus::SE3d& T_0_1);
+  /// Triangulates the point and returns homogenous representation. First 3
+  /// components - unit-length direction vector. Last component inverse
+  /// distance.
+  template <class Derived>
+  static Eigen::Matrix<typename Derived::Scalar, 4, 1> triangulate(
+      const Eigen::MatrixBase<Derived>& f0,
+      const Eigen::MatrixBase<Derived>& f1,
+      const Sophus::SE3<typename Derived::Scalar>& T_0_1) {
+    EIGEN_STATIC_ASSERT_VECTOR_SPECIFIC_SIZE(Derived, 3);
+
+    using Scalar = typename Derived::Scalar;
+    using Vec4 = Eigen::Matrix<Scalar, 4, 1>;
+
+    Eigen::Matrix<Scalar, 3, 4> P1, P2;
+    P1.setIdentity();
+    P2 = T_0_1.inverse().matrix3x4();
+
+    Eigen::Matrix<Scalar, 4, 4> A(4, 4);
+    A.row(0) = f0[0] * P1.row(2) - f0[2] * P1.row(0);
+    A.row(1) = f0[1] * P1.row(2) - f0[2] * P1.row(1);
+    A.row(2) = f1[0] * P2.row(2) - f1[2] * P2.row(0);
+    A.row(3) = f1[1] * P2.row(2) - f1[2] * P2.row(1);
+
+    Eigen::JacobiSVD<Eigen::Matrix<Scalar, 4, 4>> mySVD(A, Eigen::ComputeFullV);
+    Vec4 worldPoint = mySVD.matrixV().col(3);
+    worldPoint /= worldPoint.template head<3>().norm();
+
+    // Enforce same direction of bearing vector and initial point
+    if (f0.dot(worldPoint.template head<3>()) < 0) worldPoint *= -1;
+
+    return worldPoint;
+  }
 
   template <class AccumT>
   static void linearizeAbs(const Eigen::MatrixXd& rel_H,
@@ -263,8 +285,8 @@ class BundleAdjustmentBase {
       const TimeCamId& tcid_h = rld.order[i].first;
       const TimeCamId& tcid_ti = rld.order[i].second;
 
-      int abs_h_idx = aom.abs_order_map.at(tcid_h.first).first;
-      int abs_ti_idx = aom.abs_order_map.at(tcid_ti.first).first;
+      int abs_h_idx = aom.abs_order_map.at(tcid_h.frame_id).first;
+      int abs_ti_idx = aom.abs_order_map.at(tcid_ti.frame_id).first;
 
       accum.template addB<POSE_SIZE>(
           abs_h_idx, rld.d_rel_d_h[i].transpose() *
@@ -278,34 +300,39 @@ class BundleAdjustmentBase {
 
         const TimeCamId& tcid_tj = rld.order[j].second;
 
-        int abs_tj_idx = aom.abs_order_map.at(tcid_tj.first).first;
+        int abs_tj_idx = aom.abs_order_map.at(tcid_tj.frame_id).first;
 
-        if (tcid_h.first == tcid_ti.first || tcid_h.first == tcid_tj.first)
+        if (tcid_h.frame_id == tcid_ti.frame_id ||
+            tcid_h.frame_id == tcid_tj.frame_id)
           continue;
 
         accum.template addH<POSE_SIZE, POSE_SIZE>(
-            abs_h_idx, abs_h_idx, rld.d_rel_d_h[i].transpose() *
-                                      rel_H.block<POSE_SIZE, POSE_SIZE>(
-                                          POSE_SIZE * i, POSE_SIZE * j) *
-                                      rld.d_rel_d_h[j]);
+            abs_h_idx, abs_h_idx,
+            rld.d_rel_d_h[i].transpose() *
+                rel_H.block<POSE_SIZE, POSE_SIZE>(POSE_SIZE * i,
+                                                  POSE_SIZE * j) *
+                rld.d_rel_d_h[j]);
 
         accum.template addH<POSE_SIZE, POSE_SIZE>(
-            abs_ti_idx, abs_h_idx, rld.d_rel_d_t[i].transpose() *
-                                       rel_H.block<POSE_SIZE, POSE_SIZE>(
-                                           POSE_SIZE * i, POSE_SIZE * j) *
-                                       rld.d_rel_d_h[j]);
+            abs_ti_idx, abs_h_idx,
+            rld.d_rel_d_t[i].transpose() *
+                rel_H.block<POSE_SIZE, POSE_SIZE>(POSE_SIZE * i,
+                                                  POSE_SIZE * j) *
+                rld.d_rel_d_h[j]);
 
         accum.template addH<POSE_SIZE, POSE_SIZE>(
-            abs_h_idx, abs_tj_idx, rld.d_rel_d_h[i].transpose() *
-                                       rel_H.block<POSE_SIZE, POSE_SIZE>(
-                                           POSE_SIZE * i, POSE_SIZE * j) *
-                                       rld.d_rel_d_t[j]);
+            abs_h_idx, abs_tj_idx,
+            rld.d_rel_d_h[i].transpose() *
+                rel_H.block<POSE_SIZE, POSE_SIZE>(POSE_SIZE * i,
+                                                  POSE_SIZE * j) *
+                rld.d_rel_d_t[j]);
 
         accum.template addH<POSE_SIZE, POSE_SIZE>(
-            abs_ti_idx, abs_tj_idx, rld.d_rel_d_t[i].transpose() *
-                                        rel_H.block<POSE_SIZE, POSE_SIZE>(
-                                            POSE_SIZE * i, POSE_SIZE * j) *
-                                        rld.d_rel_d_t[j]);
+            abs_ti_idx, abs_tj_idx,
+            rld.d_rel_d_t[i].transpose() *
+                rel_H.block<POSE_SIZE, POSE_SIZE>(POSE_SIZE * i,
+                                                  POSE_SIZE * j) *
+                rld.d_rel_d_t[j]);
       }
     }
   }
@@ -359,14 +386,11 @@ class BundleAdjustmentBase {
   Eigen::map<int64_t, PoseStateWithLin> frame_poses;
 
   // Point management
-  Eigen::unordered_map<int, KeypointPosition> kpts;
-  Eigen::map<TimeCamId,
-             Eigen::map<TimeCamId, Eigen::vector<KeypointObservation>>>
-      obs;
+  LandmarkDatabase lmdb;
 
   double obs_std_dev;
   double huber_thresh;
 
   basalt::Calibration<double> calib;
 };
-}
+}  // namespace basalt

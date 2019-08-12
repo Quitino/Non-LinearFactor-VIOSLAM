@@ -33,20 +33,22 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
 #include <basalt/io/dataset_io.h>
 #include <basalt/io/dataset_io_euroc.h>
 #include <basalt/io/dataset_io_rosbag.h>
+#include <basalt/io/dataset_io_uzh.h>
 
 namespace basalt {
 
 DatasetIoInterfacePtr DatasetIoFactory::getDatasetIo(
-    const std::string &dataset_type, bool with_images) {
+    const std::string &dataset_type) {
   if (dataset_type == "euroc") {
     // return DatasetIoInterfacePtr();
     return DatasetIoInterfacePtr(new EurocIO);
   } else if (dataset_type == "bag") {
-    return DatasetIoInterfacePtr(new RosbagIO(with_images));
+    return DatasetIoInterfacePtr(new RosbagIO);
+  } else if (dataset_type == "uzh") {
+    return DatasetIoInterfacePtr(new UzhIO);
   } else {
     std::cerr << "Dataset type " << dataset_type << " is not supported"
               << std::endl;

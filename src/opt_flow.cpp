@@ -33,7 +33,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -245,14 +244,15 @@ int main(int argc, char** argv) {
 
         for (size_t cam_id = 0; cam_id < calib.intrinsics.size(); cam_id++) {
           if (img_vec[cam_id].img.get()) {
-            auto img = img_vec[cam_id].img->toPangoImage();
+            auto img = img_vec[cam_id].img;
 
             pangolin::GlPixFormat fmt;
             fmt.glformat = GL_LUMINANCE;
             fmt.gltype = GL_UNSIGNED_SHORT;
             fmt.scalable_internal_format = GL_LUMINANCE16;
 
-            img_view[cam_id]->SetImage(img.ptr, img.w, img.h, img.pitch, fmt);
+            img_view[cam_id]->SetImage(img->ptr, img->w, img->h, img->pitch,
+                                       fmt);
           } else {
             img_view[cam_id]->Clear();
           }
@@ -279,6 +279,8 @@ int main(int argc, char** argv) {
 }
 
 void draw_image_overlay(pangolin::View& v, size_t cam_id) {
+  UNUSED(v);
+
   size_t frame_id = static_cast<size_t>(show_frame);
   int64_t t_ns = vio_dataset->get_image_timestamps()[frame_id];
 
@@ -321,8 +323,8 @@ void load_data(const std::string& calib_path) {
   if (os.is_open()) {
     cereal::JSONInputArchive archive(os);
     archive(calib);
-    std::cout << "Loaded camera with " << calib.intrinsics.size()
-              << " cameras" << std::endl;
+    std::cout << "Loaded camera with " << calib.intrinsics.size() << " cameras"
+              << std::endl;
 
   } else {
     std::cerr << "could not load camera calibration " << calib_path

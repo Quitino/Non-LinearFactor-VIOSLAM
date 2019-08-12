@@ -40,8 +40,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <Eigen/Dense>
 #include <sophus/se3.hpp>
 
-#include <pangolin/image/managed_image.h>
-
 #include <basalt/utils/image.h>
 #include <basalt/utils/sophus_utils.hpp>
 
@@ -53,7 +51,7 @@ namespace basalt {
 typedef std::bitset<256> Descriptor;
 
 void detectKeypointsMapping(const basalt::Image<const uint16_t>& img_raw,
-                      KeypointsData& kd, int num_features);
+                            KeypointsData& kd, int num_features);
 
 void detectKeypoints(const basalt::Image<const uint16_t>& img_raw,
                      KeypointsData& kd, int PATCH_SIZE = 32,
@@ -66,11 +64,6 @@ void computeAngles(const basalt::Image<const uint16_t>& img_raw,
 
 void computeDescriptors(const basalt::Image<const uint16_t>& img_raw,
                         KeypointsData& kd);
-
-void matchFastHelper(const std::vector<std::bitset<256>>& corner_descriptors_1,
-                     const std::vector<std::bitset<256>>& corner_descriptors_2,
-                     std::map<int, int>& matches, int threshold,
-                     double test_dist);
 
 void matchDescriptors(const std::vector<std::bitset<256>>& corner_descriptors_1,
                       const std::vector<std::bitset<256>>& corner_descriptors_2,

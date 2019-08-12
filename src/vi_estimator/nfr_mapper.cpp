@@ -39,40 +39,38 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/utils/tracks.h>
 #include <basalt/vi_estimator/nfr_mapper.h>
 
-#include <DBoW3.h>
+#include <basalt/hash_bow/hash_bow.h>
 
 namespace basalt {
 
-NfrMapper::NfrMapper(const Calibration<double>& calib, const VioConfig& config,
-                     const std::string& vocabulary)
+NfrMapper::NfrMapper(const Calibration<double>& calib, const VioConfig& config)
     : config(config) {
   this->calib = calib;
   this->obs_std_dev = config.mapper_obs_std_dev;
   this->huber_thresh = config.mapper_obs_huber_thresh;
 
-  if (!vocabulary.empty()) {
-    DBoW3::Vocabulary voc(vocabulary);
-    bow_database.setVocabulary(voc);
-  }
+  hash_bow_database.reset(new HashBow<256>(config.mapper_bow_num_bits));
 }
 
 void NfrMapper::addMargData(MargData::Ptr& data) {
-  for (const auto& kv : data->frame_poses) {
-    PoseStateWithLin p(kv.second.getT_ns(), kv.second.getPose());
+  processMargData(*data);
+  bool valid = extractNonlinearFactors(*data);
 
-    frame_poses[kv.first] = p;
-  }
+  if (valid) {
+    for (const auto& kv : data->frame_poses) {
+      PoseStateWithLin p(kv.second.getT_ns(), kv.second.getPose());
 
-  for (const auto& kv : data->frame_states) {
-    if (data->kfs_all.count(kv.first) > 0) {
-      auto state = kv.second;
-      PoseStateWithLin p(state.getState().t_ns, state.getState().T_w_i);
       frame_poses[kv.first] = p;
     }
-  }
 
-  processMargData(*data);
-  extractNonlinearFactors(*data);
+    for (const auto& kv : data->frame_states) {
+      if (data->kfs_all.count(kv.first) > 0) {
+        auto state = kv.second;
+        PoseStateWithLin p(state.getState().t_ns, state.getState().T_w_i);
+        frame_poses[kv.first] = p;
+      }
+    }
+  }
 }
 
 void NfrMapper::processMargData(MargData& m) {
@@ -142,13 +140,14 @@ void NfrMapper::processMargData(MargData& m) {
   }
 }
 
-void NfrMapper::extractNonlinearFactors(MargData& m) {
+bool NfrMapper::extractNonlinearFactors(MargData& m) {
   size_t asize = m.aom.total_size;
   // std::cout << "asize " << asize << std::endl;
 
-  Eigen::MatrixXd cov_old;
-  cov_old.setIdentity(asize, asize);
-  m.abs_H.ldlt().solveInPlace(cov_old);
+  Eigen::FullPivHouseholderQR<Eigen::MatrixXd> qr(m.abs_H);
+  if (qr.rank() != m.abs_H.cols()) return false;
+
+  Eigen::MatrixXd cov_old = qr.solve(Eigen::MatrixXd::Identity(asize, asize));
 
   int64_t kf_id = *m.kfs_to_marg.cbegin();
   int kf_start_idx = m.aom.abs_order_map.at(kf_id).first;
@@ -183,7 +182,12 @@ void NfrMapper::extractNonlinearFactors(MargData& m) {
     RollPitchFactor rpf;
     rpf.t_ns = kf_id;
     rpf.R_w_i_meas = T_w_i_kf.so3();
-    rpf.cov_inv = cov_new.block<2, 2>(4, 4).inverse();
+
+    if (!config.mapper_no_factor_weights) {
+      rpf.cov_inv = cov_new.block<2, 2>(4, 4).inverse();
+    } else {
+      rpf.cov_inv.setIdentity();
+    }
 
     roll_pitch_factors.emplace_back(rpf);
   }
@@ -214,12 +218,17 @@ void NfrMapper::extractNonlinearFactors(MargData& m) {
     rpf.t_j_ns = other_id;
     rpf.T_i_j = T_kf_o;
     rpf.cov_inv.setIdentity();
-    cov_new.ldlt().solveInPlace(rpf.cov_inv);
+
+    if (!config.mapper_no_factor_weights) {
+      cov_new.ldlt().solveInPlace(rpf.cov_inv);
+    }
 
     // std::cout << "rpf.cov_inv\n" << rpf.cov_inv << std::endl;
 
     rel_pose_factors.emplace_back(rpf);
   }
+
+  return true;
 }
 
 void NfrMapper::optimize(int num_iterations) {
@@ -235,7 +244,7 @@ void NfrMapper::optimize(int num_iterations) {
 
     double rld_error;
     Eigen::vector<RelLinData> rld_vec;
-    linearizeHelper(rld_vec, obs, rld_error);
+    linearizeHelper(rld_vec, lmdb.getObservations(), rld_error);
 
     //      SparseHashAccumulator<double> accum;
     //      accum.reset(aom.total_size);
@@ -274,7 +283,11 @@ void NfrMapper::optimize(int num_iterations) {
     lopt.accum.iterative_solver = true;
     lopt.accum.print_info = true;
 
-    const Eigen::VectorXd inc = lopt.accum.solve();
+    lopt.accum.setup_solver();
+    Eigen::VectorXd Hdiag = lopt.accum.Hdiagonal();
+    Hdiag.setConstant(Hdiag.size(), 1e-6);
+
+    const Eigen::VectorXd inc = lopt.accum.solve(&Hdiag);
 
     // apply increment to poses
     for (auto& kv : frame_poses) {
@@ -365,7 +378,9 @@ void NfrMapper::computeRollPitch(double& roll_pitch_error) {
 void NfrMapper::detect_keypoints() {
   std::vector<int64_t> keys;
   for (const auto& kv : img_data) {
-    keys.emplace_back(kv.first);
+    if (frame_poses.count(kv.first) > 0) {
+      keys.emplace_back(kv.first);
+    }
   }
 
   auto t1 = std::chrono::high_resolution_clock::now();
@@ -378,7 +393,7 @@ void NfrMapper::detect_keypoints() {
           if (kv->second.get()) {
             for (size_t i = 0; i < kv->second->img_data.size(); i++) {
               TimeCamId tcid(kv->first, i);
-              KeypointsData kd;
+              KeypointsData& kd = feature_corners[tcid];
 
               if (!kv->second->img_data[i].img.get()) continue;
 
@@ -391,21 +406,16 @@ void NfrMapper::detect_keypoints() {
               computeDescriptors(img, kd);
 
               std::vector<bool> success;
-              calib.intrinsics[tcid.second].unproject(kd.corners, kd.corners_3d,
+              calib.intrinsics[tcid.cam_id].unproject(kd.corners, kd.corners_3d,
                                                       success);
 
-              feature_corners[tcid] = kd;
+              hash_bow_database->compute_bow(kd.corner_descriptors, kd.hashes,
+                                             kd.bow_vector);
 
-              auto& bow = bow_data[tcid];
+              hash_bow_database->add_to_database(tcid, kd.bow_vector);
 
-              if (bow_database.usingDirectIndex()) {
-                bow_database.getVocabulary()->transform(
-                    kd.corner_descriptors, bow.first, bow.second,
-                    bow_database.getDirectIndexLevels());
-              } else {
-                bow_database.getVocabulary()->transform(kd.corner_descriptors,
-                                                        bow.first);
-              }
+              // std::cout << "bow " << kd.bow_vector.size() << " desc "
+              //          << kd.corner_descriptors.size() << std::endl;
             }
           }
         }
@@ -413,28 +423,13 @@ void NfrMapper::detect_keypoints() {
 
   auto t2 = std::chrono::high_resolution_clock::now();
 
-  for (const auto& kv : bow_data) {
-    int bow_id;
-    if (bow_database.usingDirectIndex()) {
-      bow_id = bow_database.add(kv.second.first, kv.second.second);
-    } else {
-      bow_id = bow_database.add(kv.second.first);
-    }
-    bow_id_to_tcid[bow_id] = kv.first;
-  }
-
-  auto t3 = std::chrono::high_resolution_clock::now();
-
   auto elapsed1 =
       std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-  auto elapsed2 =
-      std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2);
 
   std::cout << "Processed " << feature_corners.size() << " frames."
             << std::endl;
 
-  std::cout << "Detection time: " << elapsed1.count() * 1e-6
-            << "s. Adding to DB time: " << elapsed2.count() * 1e-6 << "s."
+  std::cout << "Detection time: " << elapsed1.count() * 1e-6 << "s."
             << std::endl;
 }
 
@@ -502,33 +497,34 @@ void NfrMapper::match_all() {
   tbb::blocked_range<size_t> keys_range(0, keys.size());
   auto compute_pairs = [&](const tbb::blocked_range<size_t>& r) {
     for (size_t i = r.begin(); i != r.end(); ++i) {
-      DBoW3::QueryResults q;
+      const TimeCamId& tcid = keys[i];
+      const KeypointsData& kd = feature_corners.at(tcid);
 
-      auto it = bow_data.find(keys[i]);
+      std::vector<std::pair<TimeCamId, double>> results;
 
-      if (it != bow_data.end()) {
-        bow_database.query(it->second.first, q,
-                           config.mapper_num_frames_to_match);
+      hash_bow_database->querry_database(kd.bow_vector,
+                                         config.mapper_num_frames_to_match,
+                                         results, &tcid.frame_id);
 
-        for (const auto& r : q) {
-          // Match only previous frames
+      // std::cout << "Closest frames for " << tcid << ": ";
+      for (const auto& otcid_score : results) {
+        // std::cout << otcid_score.first << "(" << otcid_score.second << ") ";
+        if (otcid_score.first.frame_id != tcid.frame_id &&
+            otcid_score.second > config.mapper_frames_to_match_threshold) {
+          match_pair m;
+          m.i = i;
+          m.j = id_to_key_idx.at(otcid_score.first);
+          m.score = otcid_score.second;
 
-          size_t j = id_to_key_idx.at(bow_id_to_tcid.at(r.Id));
-          if (r.Score > config.mapper_frames_to_match_threshold &&
-              keys[i].first < keys[j].first) {
-            match_pair m;
-            m.i = i;
-            m.j = j;
-            m.score = r.Score;
-
-            ids_to_match.emplace_back(m);
-          }
+          ids_to_match.emplace_back(m);
         }
       }
+      // std::cout << std::endl;
     }
   };
 
   tbb::parallel_for(keys_range, compute_pairs);
+  // compute_pairs(keys_range);
 
   auto t2 = std::chrono::high_resolution_clock::now();
 
@@ -621,6 +617,9 @@ void NfrMapper::build_tracks() {
 }
 
 void NfrMapper::setup_opt() {
+  const double min_triang_distance2 = config.mapper_min_triangulation_dist *
+                                      config.mapper_min_triangulation_dist;
+
   for (const auto& kv : feature_tracks) {
     if (kv.second.size() < 2) continue;
 
@@ -631,7 +630,7 @@ void NfrMapper::setup_opt() {
     FeatureId feat_id_h = it->second;
     Eigen::Vector2d pos_2d_h = feature_corners.at(tcid_h).corners[feat_id_h];
     Eigen::Vector4d pos_3d_h;
-    calib.intrinsics[tcid_h.second].unproject(pos_2d_h, pos_3d_h);
+    calib.intrinsics[tcid_h.cam_id].unproject(pos_2d_h, pos_3d_h);
 
     it++;
 
@@ -641,31 +640,37 @@ void NfrMapper::setup_opt() {
       FeatureId feat_id_o = it->second;
       Eigen::Vector2d pos_2d_o = feature_corners.at(tcid_o).corners[feat_id_o];
       Eigen::Vector4d pos_3d_o;
-      calib.intrinsics[tcid_o.second].unproject(pos_2d_o, pos_3d_o);
+      calib.intrinsics[tcid_o.cam_id].unproject(pos_2d_o, pos_3d_o);
 
-      Sophus::SE3d T_w_h =
-          frame_poses.at(tcid_h.first).getPose() * calib.T_i_c[tcid_h.second];
-      Sophus::SE3d T_w_o =
-          frame_poses.at(tcid_o.first).getPose() * calib.T_i_c[tcid_o.second];
+      Sophus::SE3d T_w_h = frame_poses.at(tcid_h.frame_id).getPose() *
+                           calib.T_i_c[tcid_h.cam_id];
+      Sophus::SE3d T_w_o = frame_poses.at(tcid_o.frame_id).getPose() *
+                           calib.T_i_c[tcid_o.cam_id];
 
-      Eigen::Vector4d pos_3d = triangulate(
-          pos_3d_h.head<3>(), pos_3d_o.head<3>(), T_w_h.inverse() * T_w_o);
+      Sophus::SE3d T_h_o = T_w_h.inverse() * T_w_o;
 
-      if (pos_3d[2] < 0.5 || pos_3d.norm() < 0.5) continue;
+      if (T_h_o.translation().squaredNorm() < min_triang_distance2) continue;
+
+      Eigen::Vector4d pos_3d =
+          triangulate(pos_3d_h.head<3>(), pos_3d_o.head<3>(), T_h_o);
+
+      if (!pos_3d.array().isFinite().all() || pos_3d[3] <= 0 || pos_3d[3] > 2.0)
+        continue;
 
       KeypointPosition pos;
       pos.kf_id = tcid_h;
       pos.dir = StereographicParam<double>::project(pos_3d);
-      pos.id = 1.0 / pos_3d.norm();
+      pos.id = pos_3d[3];
 
-      kpts[kv.first] = pos;
+      lmdb.addLandmark(kv.first, pos);
 
       for (const auto& obs_kv : kv.second) {
         KeypointObservation ko;
         ko.kpt_id = kv.first;
         ko.pos = feature_corners.at(obs_kv.first).corners[obs_kv.second];
 
-        obs[tcid_h][obs_kv.first].emplace_back(ko);
+        lmdb.addObservation(obs_kv.first, ko);
+        // obs[tcid_h][obs_kv.first].emplace_back(ko);
       }
       break;
     }

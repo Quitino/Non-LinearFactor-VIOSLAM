@@ -35,6 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <basalt/io/dataset_io.h>
+#include <basalt/utils/common_types.h>
 #include <basalt/calibration/calibration.hpp>
 
 #include <tbb/concurrent_unordered_map.h>
@@ -48,6 +49,13 @@ struct CalibCornerData {
   std::vector<double> radii;  //!< threshold used for maximum displacement
                               //! during sub-pix refinement; Search region is
   //! slightly larger.
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+struct ProjectedCornerData {
+  Eigen::vector<Eigen::Vector2d> corners_proj;
+  std::vector<bool> corners_proj_success;
+
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
@@ -69,7 +77,7 @@ class CalibHelper {
           calib_corners_rejected);
 
   static void initCamPoses(
-      const Calibration<double>::Ptr& calib, const VioDatasetPtr& vio_data,
+      const Calibration<double>::Ptr& calib,
       const Eigen::vector<Eigen::Vector4d>& aprilgrid_corner_pos_3d,
       tbb::concurrent_unordered_map<TimeCamId, CalibCornerData>& calib_corners,
       tbb::concurrent_unordered_map<TimeCamId, CalibInitPoseData>&

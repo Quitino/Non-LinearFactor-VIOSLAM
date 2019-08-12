@@ -33,7 +33,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -120,7 +119,7 @@ double alignButton();
 void setup_points();
 
 constexpr int UI_WIDTH = 200;
-constexpr int NUM_FRAMES = 500;
+// constexpr int NUM_FRAMES = 500;
 
 basalt::Calibration<double> calib;
 
@@ -133,13 +132,14 @@ Button optimize_btn("ui.optimize", &optimize);
 Button rand_inc_btn("ui.rand_inc", &randomInc);
 Button rand_yaw_inc_btn("ui.rand_yaw", &randomYawInc);
 Button setup_points_btn("ui.setup_points", &setup_points);
-Button align_svd_btn("ui.align_svd", &alignButton);
+Button align_se3_btn("ui.align_se3", &alignButton);
 
 std::string marg_data_path;
 
 int main(int argc, char** argv) {
   bool show_gui = true;
   std::string cam_calib_path;
+  std::string result_path;
 
   CLI::App app{"App description"};
 
@@ -150,6 +150,9 @@ int main(int argc, char** argv) {
 
   app.add_option("--marg-data", marg_data_path, "Path to cache folder.")
       ->required();
+
+  app.add_option("--result-path", result_path,
+                 "Path to result file where the system will write RMSE ATE.");
 
   try {
     app.parse(argc, argv);
@@ -204,6 +207,17 @@ int main(int argc, char** argv) {
       pangolin::FinishFrame();
 
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  } else {
+    setup_points();
+    optimize();
+
+    if (!result_path.empty()) {
+      double error = alignButton();
+
+      std::ofstream os(result_path);
+      os << error << std::endl;
+      os.close();
     }
   }
 
@@ -465,14 +479,14 @@ void extractNonlinearFactors(basalt::MargData& m) {
 
 void computeEdgeVis() {
   edges_vis.clear();
-  for (const auto& kv1 : nrf_mapper->obs) {
+  for (const auto& kv1 : nrf_mapper->lmdb.getObservations()) {
     for (const auto& kv2 : kv1.second) {
       Eigen::Vector3d p1 = nrf_mapper->getFramePoses()
-                               .at(kv1.first.first)
+                               .at(kv1.first.frame_id)
                                .getPose()
                                .translation();
       Eigen::Vector3d p2 = nrf_mapper->getFramePoses()
-                               .at(kv2.first.first)
+                               .at(kv2.first.frame_id)
                                .getPose()
                                .translation();
 

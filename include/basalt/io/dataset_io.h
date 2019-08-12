@@ -32,8 +32,8 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
-#ifndef DATASET_IO_H
-#define DATASET_IO_H
+
+#pragma once
 
 #include <array>
 #include <fstream>
@@ -64,16 +64,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/camera/generic_camera.hpp>
 #include <basalt/camera/stereographic_param.hpp>
 
-#include <pangolin/image/image_io.h>
-
 namespace basalt {
 
 inline bool file_exists(const std::string &name) {
   std::ifstream f(name.c_str());
   return f.good();
 }
-
-typedef std::pair<int64_t, size_t> TimeCamId;
 
 struct ImageData {
   ImageData() : exposure(0) {}
@@ -152,8 +148,7 @@ typedef std::shared_ptr<DatasetIoInterface> DatasetIoInterfacePtr;
 
 class DatasetIoFactory {
  public:
-  static DatasetIoInterfacePtr getDatasetIo(const std::string &dataset_type,
-                                            bool with_images = true);
+  static DatasetIoInterfacePtr getDatasetIo(const std::string &dataset_type);
 };
 
 }  // namespace basalt
@@ -162,7 +157,7 @@ namespace cereal {
 
 template <class Archive, class _Scalar, int _Rows, int _Cols, int _Options,
           int _MaxRows, int _MaxCols>
-inline
+static inline
     typename std::enable_if<_Rows == Eigen::Dynamic || _Cols == Eigen::Dynamic,
                             void>::type
     save(Archive &ar, const Eigen::Matrix<_Scalar, _Rows, _Cols, _Options,
@@ -176,11 +171,12 @@ inline
 
 template <class Archive, class _Scalar, int _Rows, int _Cols, int _Options,
           int _MaxRows, int _MaxCols>
-inline
+static inline
     typename std::enable_if<_Rows == Eigen::Dynamic || _Cols == Eigen::Dynamic,
                             void>::type
-    load(Archive &ar, Eigen::Matrix<_Scalar, _Rows, _Cols, _Options, _MaxRows,
-                                    _MaxCols> &matrix) {
+    load(Archive &ar,
+         Eigen::Matrix<_Scalar, _Rows, _Cols, _Options, _MaxRows, _MaxCols>
+             &matrix) {
   std::int32_t rows;
   std::int32_t cols;
   ar(rows);
@@ -213,35 +209,3 @@ void serialize(Archive &ar, basalt::AccelData &c) {
 }
 
 }  // namespace cereal
-
-namespace std {
-
-inline void hash_combine(std::size_t &seed, std::size_t value) {
-  seed ^= value + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-}
-
-template <>
-struct hash<basalt::TimeCamId> {
-  size_t operator()(const basalt::TimeCamId &x) const {
-    size_t seed = 0;
-    hash_combine(seed, std::hash<int>()(x.first));
-    hash_combine(seed, std::hash<int>()(x.second));
-    return seed;
-  }
-};
-
-template <>
-struct hash<std::pair<basalt::TimeCamId, basalt::TimeCamId>> {
-  size_t operator()(
-      const std::pair<basalt::TimeCamId, basalt::TimeCamId> &x) const {
-    size_t seed = 0;
-    hash_combine(seed, std::hash<int>()(x.first.first));
-    hash_combine(seed, std::hash<int>()(x.first.second));
-    hash_combine(seed, std::hash<int>()(x.second.first));
-    hash_combine(seed, std::hash<int>()(x.second.second));
-    return seed;
-  }
-};
-}  // namespace std
-
-#endif  // DATASET_IO_H

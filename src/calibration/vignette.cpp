@@ -33,19 +33,22 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
 #include <basalt/calibration/vignette.h>
+
+#include <opencv2/highgui/highgui.hpp>
 
 namespace basalt {
 
 VignetteEstimator::VignetteEstimator(
     const VioDatasetPtr &vio_dataset,
     const Eigen::vector<Eigen::Vector2d> &optical_centers,
+    const Eigen::vector<Eigen::Vector2i> &resolutions,
     const std::map<TimeCamId, Eigen::vector<Eigen::Vector3d>>
         &reprojected_vignette,
     const AprilGrid &april_grid)
     : vio_dataset(vio_dataset),
       optical_centers(optical_centers),
+      resolutions(resolutions),
       reprojected_vignette(reprojected_vignette),
       april_grid(april_grid),
       vign_param(vio_dataset->get_num_cams(),
@@ -92,7 +95,7 @@ void VignetteEstimator::compute_error(
     const TimeCamId &tcid = kv.first;
     const auto &points_2d_val = kv.second;
 
-    Eigen::Vector2d oc = optical_centers[tcid.second];
+    Eigen::Vector2d oc = optical_centers[tcid.cam_id];
 
     BASALT_ASSERT(points_2d_val.size() ==
                   april_grid.aprilgrid_vignette_pos_3d.size());
@@ -105,7 +108,7 @@ void VignetteEstimator::compute_error(
         int64_t loc =
             (points_2d_val[i].head<2>() - oc).norm() * 1e9;  // in pixels * 1e9
         double e =
-            irradiance[i] * vign_param[tcid.second].evaluate(loc)[0] - val;
+            irradiance[i] * vign_param[tcid.cam_id].evaluate(loc)[0] - val;
         ve[i] = e;
         error += e * e;
         mean_residual += std::abs(e);
@@ -148,7 +151,7 @@ void VignetteEstimator::opt_irradience() {
     const TimeCamId &tcid = kv.first;
     const auto &points_2d_val = kv.second;
 
-    Eigen::Vector2d oc = optical_centers[tcid.second];
+    Eigen::Vector2d oc = optical_centers[tcid.cam_id];
 
     BASALT_ASSERT(points_2d_val.size() ==
                   april_grid.aprilgrid_vignette_pos_3d.size());
@@ -159,7 +162,7 @@ void VignetteEstimator::opt_irradience() {
         int64_t loc =
             (points_2d_val[i].head<2>() - oc).norm() * 1e9;  // in pixels * 1e9
 
-        new_irradiance[i] += val / vign_param[tcid.second].evaluate(loc)[0];
+        new_irradiance[i] += val / vign_param[tcid.cam_id].evaluate(loc)[0];
         new_irradiance_count[i] += 1;
       }
     }
@@ -190,7 +193,7 @@ void VignetteEstimator::opt_vign() {
     //      Eigen::Vector3d::UnitZ();
     //      if (-opt_axis_w[2] < angle_threshold) continue;
 
-    Eigen::Vector2d oc = optical_centers[tcid.second];
+    Eigen::Vector2d oc = optical_centers[tcid.cam_id];
 
     BASALT_ASSERT(points_2d_val.size() ==
                   april_grid.aprilgrid_vignette_pos_3d.size());
@@ -201,12 +204,12 @@ void VignetteEstimator::opt_vign() {
         int64_t loc = (points_2d_val[i].head<2>() - oc).norm() * 1e9;
 
         RdSpline<1, SPLINE_N>::JacobianStruct J;
-        vign_param[tcid.second].evaluate(loc, &J);
+        vign_param[tcid.cam_id].evaluate(loc, &J);
 
         for (size_t k = 0; k < J.d_val_d_knot.size(); k++) {
-          new_vign_param[tcid.second][J.start_idx + k] +=
+          new_vign_param[tcid.cam_id][J.start_idx + k] +=
               J.d_val_d_knot[k] * val / irradiance[i];
-          new_vign_param_count[tcid.second][J.start_idx + k] +=
+          new_vign_param_count[tcid.cam_id][J.start_idx + k] +=
               J.d_val_d_knot[k];
         }
       }
@@ -244,7 +247,8 @@ void VignetteEstimator::optimize() {
   }
 }
 
-void VignetteEstimator::compute_data_log(pangolin::DataLog &vign_data_log) {
+void VignetteEstimator::compute_data_log(
+    std::vector<std::vector<float>> &vign_data_log) {
   std::vector<std::vector<double>> num_proj_points(
       2, std::vector<double>(vign_size, 0));
 
@@ -252,7 +256,7 @@ void VignetteEstimator::compute_data_log(pangolin::DataLog &vign_data_log) {
     const TimeCamId &tcid = kv.first;
     const auto &points_2d = kv.second;
 
-    Eigen::Vector2d oc = optical_centers[tcid.second];
+    Eigen::Vector2d oc = optical_centers[tcid.cam_id];
 
     BASALT_ASSERT(points_2d.size() ==
                   april_grid.aprilgrid_vignette_pos_3d.size());
@@ -260,12 +264,12 @@ void VignetteEstimator::compute_data_log(pangolin::DataLog &vign_data_log) {
     for (size_t i = 0; i < points_2d.size(); i++) {
       if (points_2d[i][2] >= 0) {
         size_t loc = (points_2d[i].head<2>() - oc).norm();
-        num_proj_points[tcid.second][loc] += 1.;
+        num_proj_points[tcid.cam_id][loc] += 1.;
       }
     }
   }
 
-  vign_data_log.Clear();
+  vign_data_log.clear();
   for (size_t i = 0; i < vign_size; i++) {
     std::vector<float> log_data;
     for (size_t j = 0; j < vio_dataset->get_num_cams(); j++) {
@@ -273,15 +277,13 @@ void VignetteEstimator::compute_data_log(pangolin::DataLog &vign_data_log) {
       log_data.push_back(vign_param[j].evaluate(loc)[0]);
       log_data.push_back(num_proj_points[j][i]);
     }
-    vign_data_log.Log(log_data);
+    vign_data_log.push_back(log_data);
   }
 }
 
 void VignetteEstimator::save_vign_png(const std::string &path) {
   for (size_t k = 0; k < vio_dataset->get_num_cams(); k++) {
-    auto img =
-        vio_dataset->get_image_data(vio_dataset->get_image_timestamps()[0])[0];
-    pangolin::ManagedImage<uint16_t> vign_img(img.img->w, img.img->h);
+    ManagedImage<uint16_t> vign_img(resolutions[k][0], resolutions[k][1]);
     vign_img.Fill(0);
 
     Eigen::Vector2d oc = optical_centers[k];
@@ -298,9 +300,12 @@ void VignetteEstimator::save_vign_png(const std::string &path) {
       }
     }
 
-    pangolin::SaveImage(vign_img.UnsafeReinterpret<uint8_t>(),
-                        pangolin::PixelFormatFromString("GRAY16LE"),
-                        path + "/vingette_" + std::to_string(k) + ".png");
+    //    pangolin::SaveImage(vign_img.UnsafeReinterpret<uint8_t>(),
+    //                        pangolin::PixelFormatFromString("GRAY16LE"),
+    //                        path + "/vingette_" + std::to_string(k) + ".png");
+
+    cv::Mat img(vign_img.h, vign_img.w, CV_16U, vign_img.ptr);
+    cv::imwrite(path + "/vingette_" + std::to_string(k) + ".png", img);
   }
 }
 }  // namespace basalt

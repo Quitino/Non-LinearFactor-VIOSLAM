@@ -50,16 +50,23 @@ struct VioConfig {
   int optical_flow_max_iterations;
   int optical_flow_levels;
   float optical_flow_epipolar_error;
+  int optical_flow_skip_frames;
 
   int vio_max_states;
   int vio_max_kfs;
   int vio_min_frames_after_kf;
   float vio_new_kf_keypoints_thresh;
-  int vio_max_iterations;
   bool vio_debug;
+
+  double vio_outlier_threshold;
+  int vio_filter_iteration;
+  int vio_max_iterations;
 
   double vio_obs_std_dev;
   double vio_obs_huber_thresh;
+  double vio_min_triangulation_dist;
+
+  bool vio_enforce_realtime;
 
   double mapper_obs_std_dev;
   double mapper_obs_huber_thresh;
@@ -71,5 +78,8 @@ struct VioConfig {
   double mapper_min_track_length;
   double mapper_max_hamming_distance;
   double mapper_second_best_test_ratio;
+  int mapper_bow_num_bits;
+  double mapper_min_triangulation_dist;
+  bool mapper_no_factor_weights;
 };
 }  // namespace basalt

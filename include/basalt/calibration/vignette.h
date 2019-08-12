@@ -39,8 +39,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <basalt/spline/rd_spline.h>
 
-#include <pangolin/plot/datalog.h>
-
 namespace basalt {
 
 class VignetteEstimator {
@@ -51,6 +49,7 @@ class VignetteEstimator {
 
   VignetteEstimator(const VioDatasetPtr &vio_dataset,
                     const Eigen::vector<Eigen::Vector2d> &optical_centers,
+                    const Eigen::vector<Eigen::Vector2i> &resolutions,
                     const std::map<TimeCamId, Eigen::vector<Eigen::Vector3d>>
                         &reprojected_vignette,
                     const AprilGrid &april_grid);
@@ -64,7 +63,7 @@ class VignetteEstimator {
 
   void optimize();
 
-  void compute_data_log(pangolin::DataLog &vign_data_log);
+  void compute_data_log(std::vector<std::vector<float>> &vign_data_log);
 
   void save_vign_png(const std::string &path);
 
@@ -77,6 +76,7 @@ class VignetteEstimator {
  private:
   const VioDatasetPtr vio_dataset;
   Eigen::vector<Eigen::Vector2d> optical_centers;
+  Eigen::vector<Eigen::Vector2i> resolutions;
   std::map<TimeCamId, Eigen::vector<Eigen::Vector3d>> reprojected_vignette;
   const AprilGrid &april_grid;
 
@@ -84,4 +84,4 @@ class VignetteEstimator {
   std::vector<double> irradiance;
   std::vector<basalt::RdSpline<1, SPLINE_N>> vign_param;
 };
-}
+}  // namespace basalt

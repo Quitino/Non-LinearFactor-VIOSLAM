@@ -51,26 +51,36 @@ VioConfig::VioConfig() {
   optical_flow_max_iterations = 5;
   optical_flow_levels = 3;
   optical_flow_epipolar_error = 0.005;
+  optical_flow_skip_frames = 1;
 
   vio_max_states = 3;
   vio_max_kfs = 7;
   vio_min_frames_after_kf = 5;
   vio_new_kf_keypoints_thresh = 0.7;
-  vio_max_iterations = 5;
+
   vio_debug = false;
   vio_obs_std_dev = 0.5;
   vio_obs_huber_thresh = 1.0;
+  vio_min_triangulation_dist = 0.05;
+  vio_outlier_threshold = 3.0;
+  vio_filter_iteration = 4;
+  vio_max_iterations = 7;
+
+  vio_enforce_realtime = false;
 
   mapper_obs_std_dev = 0.25;
   mapper_obs_huber_thresh = 1.5;
   mapper_detection_num_points = 800;
   mapper_num_frames_to_match = 30;
-  mapper_frames_to_match_threshold = 0.3;
+  mapper_frames_to_match_threshold = 0.04;
   mapper_min_matches = 20;
   mapper_ransac_threshold = 5e-5;
   mapper_min_track_length = 5;
   mapper_max_hamming_distance = 70;
   mapper_second_best_test_ratio = 1.2;
+  mapper_bow_num_bits = 16;
+  mapper_min_triangulation_dist = 0.07;
+  mapper_no_factor_weights = false;
 }
 
 void VioConfig::save(const std::string& filename) {
@@ -105,6 +115,7 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.optical_flow_max_iterations));
   ar(CEREAL_NVP(config.optical_flow_epipolar_error));
   ar(CEREAL_NVP(config.optical_flow_levels));
+  ar(CEREAL_NVP(config.optical_flow_skip_frames));
 
   ar(CEREAL_NVP(config.vio_max_states));
   ar(CEREAL_NVP(config.vio_max_kfs));
@@ -112,9 +123,14 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.vio_new_kf_keypoints_thresh));
   ar(CEREAL_NVP(config.vio_debug));
   ar(CEREAL_NVP(config.vio_max_iterations));
+  ar(CEREAL_NVP(config.vio_outlier_threshold));
+  ar(CEREAL_NVP(config.vio_filter_iteration));
 
   ar(CEREAL_NVP(config.vio_obs_std_dev));
   ar(CEREAL_NVP(config.vio_obs_huber_thresh));
+  ar(CEREAL_NVP(config.vio_min_triangulation_dist));
+
+  ar(CEREAL_NVP(config.vio_enforce_realtime));
 
   ar(CEREAL_NVP(config.mapper_obs_std_dev));
   ar(CEREAL_NVP(config.mapper_obs_huber_thresh));
@@ -126,5 +142,8 @@ void serialize(Archive& ar, basalt::VioConfig& config) {
   ar(CEREAL_NVP(config.mapper_min_track_length));
   ar(CEREAL_NVP(config.mapper_max_hamming_distance));
   ar(CEREAL_NVP(config.mapper_second_best_test_ratio));
+  ar(CEREAL_NVP(config.mapper_bow_num_bits));
+  ar(CEREAL_NVP(config.mapper_min_triangulation_dist));
+  ar(CEREAL_NVP(config.mapper_no_factor_weights));
 }
 }  // namespace cereal

@@ -47,6 +47,7 @@ int main(int argc, char **argv) {
 
   std::string dataset_path;
   std::string dataset_type;
+  std::string aprilgrid_path;
   std::string result_path;
   std::string cache_dataset_name = "calib-cam-imu";
   int skip_images = 1;
@@ -64,13 +65,17 @@ int main(int argc, char **argv) {
   app.add_option("--dataset-type", dataset_type, "Dataset type (euroc, bag)")
       ->required();
 
+  app.add_option("--aprilgrid", aprilgrid_path,
+                 "Path to Aprilgrid config file)")
+      ->required();
+
   app.add_option("--gyro-noise-std", gyro_noise_std, "Gyroscope noise std");
   app.add_option("--accel-noise-std", accel_noise_std,
                  "Accelerometer noise std");
 
-  app.add_option("--gyro-bias-std", accel_bias_std,
+  app.add_option("--gyro-bias-std", gyro_bias_std,
                  "Gyroscope bias random walk std");
-  app.add_option("--accel-bias-std", gyro_bias_std,
+  app.add_option("--accel-bias-std", accel_bias_std,
                  "Accelerometer bias random walk std");
 
   app.add_option("--cache-name", cache_dataset_name,
@@ -85,7 +90,8 @@ int main(int argc, char **argv) {
   }
 
   basalt::CamImuCalib cv(
-      dataset_path, dataset_type, result_path, cache_dataset_name, skip_images,
+      dataset_path, dataset_type, aprilgrid_path, result_path,
+      cache_dataset_name, skip_images,
       {accel_noise_std, gyro_noise_std, accel_bias_std, gyro_bias_std});
 
   cv.renderingLoop();

@@ -33,7 +33,6 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -77,25 +76,13 @@ bool next_step();
 void alignButton();
 
 static const int knot_time = 3;
-static const double obs_std_dev = 0.5;
-static const double accel_std_dev = 0.23;
-static const double gyro_std_dev = 0.0027;
-
-static const double accel_bias_std_dev = 0.00123;
-static const double gyro_bias_std_dev = 0.000234;
+// static const double obs_std_dev = 0.5;
 
 Eigen::Vector3d g(0, 0, -9.81);
 
 // std::random_device rd{};
 // std::mt19937 gen{rd()};
 std::mt19937 gen{1};
-
-std::normal_distribution<> obs_noise_dist{0, obs_std_dev};
-std::normal_distribution<> gyro_noise_dist{0, gyro_std_dev};
-std::normal_distribution<> accel_noise_dist{0, accel_std_dev};
-
-std::normal_distribution<> gyro_bias_dist{0, gyro_bias_std_dev};
-std::normal_distribution<> accel_bias_dist{0, accel_bias_std_dev};
 
 // Simulated data
 
@@ -156,13 +143,14 @@ Button next_step_btn("ui.next_step", &next_step);
 
 pangolin::Var<bool> continue_btn("ui.continue", true, false, true);
 
-Button align_step_btn("ui.align_svd", &alignButton);
+Button align_step_btn("ui.align_se3", &alignButton);
 
 int main(int argc, char** argv) {
   srand(1);
 
   bool show_gui = true;
   std::string cam_calib_path;
+  std::string result_path;
 
   CLI::App app{"App description"};
 
@@ -175,6 +163,9 @@ int main(int argc, char** argv) {
                  "Folder to store marginalization data.")
       ->required();
 
+  app.add_option("--result-path", result_path,
+                 "Path to result file where the system will write RMSE ATE.");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -182,6 +173,7 @@ int main(int argc, char** argv) {
   }
 
   load_data(cam_calib_path);
+
   gen_data();
 
   setup_vio();
@@ -196,9 +188,6 @@ int main(int argc, char** argv) {
 
       data->accel = noisy_accel[i];
       data->gyro = noisy_gyro[i];
-
-      data->accel_cov.setConstant(accel_std_dev * accel_std_dev);
-      data->gyro_cov.setConstant(gyro_std_dev * gyro_std_dev);
 
       vio->addIMUToQueue(data);
     }
@@ -366,12 +355,37 @@ int main(int argc, char** argv) {
   t3.join();
   // t4.join();
 
+  if (!result_path.empty()) {
+    Eigen::vector<Eigen::Vector3d> vio_t_w_i;
+
+    auto it = vis_map.find(kf_t_ns.back());
+
+    if (it != vis_map.end()) {
+      for (const auto& t : it->second->states)
+        vio_t_w_i.emplace_back(t.translation());
+
+    } else {
+      std::cerr << "Could not find results!!" << std::endl;
+    }
+
+    BASALT_ASSERT(kf_t_ns.size() == vio_t_w_i.size());
+
+    double error =
+        basalt::alignSVD(kf_t_ns, vio_t_w_i, gt_frame_t_ns, gt_frame_t_w_i);
+
+    std::ofstream os(result_path);
+    os << error << std::endl;
+    os.close();
+  }
+
   return 0;
 }
 
 void draw_image_overlay(pangolin::View& v, size_t cam_id) {
+  UNUSED(v);
+
   size_t frame_id = show_frame;
-  basalt::TimeCamId tcid = std::make_pair(kf_t_ns[frame_id], cam_id);
+  basalt::TimeCamId tcid(kf_t_ns[frame_id], cam_id);
 
   if (show_obs) {
     glLineWidth(1.0);
@@ -492,8 +506,8 @@ void load_data(const std::string& calib_path) {
   if (os.is_open()) {
     cereal::JSONInputArchive archive(os);
     archive(calib);
-    std::cout << "Loaded camera with " << calib.intrinsics.size()
-              << " cameras" << std::endl;
+    std::cout << "Loaded camera with " << calib.intrinsics.size() << " cameras"
+              << std::endl;
 
   } else {
     std::cerr << "could not load camera calibration " << calib_path
@@ -709,9 +723,9 @@ void setup_vio() {
   basalt::VioConfig config;
   config.vio_debug = true;
 
-  vio.reset(new basalt::KeypointVioEstimator(
-      t_init_ns, T_w_i_init, vel_w_i_init, gt_gyro_bias.front(),
-      gt_accel_bias.front(), 0.0001, g, calib, config));
+  vio.reset(new basalt::KeypointVioEstimator(0.0001, g, calib, config));
+  vio->initialize(t_init_ns, T_w_i_init, vel_w_i_init, gt_gyro_bias.front(),
+                  gt_accel_bias.front());
 
   vio->setMaxStates(10000);
   vio->setMaxKfs(10000);
