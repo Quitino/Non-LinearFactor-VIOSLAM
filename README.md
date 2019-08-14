@@ -1,5 +1,8 @@
 [![pipeline status](https://gitlab.com/VladyslavUsenko/basalt/badges/master/pipeline.svg)](https://gitlab.com/VladyslavUsenko/basalt/commits/master)
 
+
+
+[泡泡机器人推荐词](https://mp.weixin.qq.com/s?__biz=MzI5MTM1MTQwMw==&mid=2247506176&idx=2&sn=709603e91a0c7f3b66323cbdb006b741&chksm=ec136704db64ee1213fdd0988b21fa5ecf3dd7db24db5385d43c7ca3d066578e181f7a8f48d0&mpshare=1&scene=1&srcid=0814JY9NM1lOIArxc8lCZwif&sharer_sharetime=1565762589294&sharer_shareid=662e33bcf39b24da66575a9f1c3f9ab8&pass_ticket=F%2FDcQUFoziFQRIZO5nFqbGSWQROwfTXyyFj%2B3FTug77yGQBpxqgMTzUTPyXdfXYW#rd)
 ## Basalt
 For more information see https://vision.in.tum.de/research/vslam/basalt
 
